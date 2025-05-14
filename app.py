@@ -15,15 +15,6 @@ import base64
 import io
 
 # === Konfiguracja ===
-KNOWLEDGE_CATEGORIES = [
-    "Komponenty UI",
-    "Integracja API",
-    "Implementacja AI",
-    "Przetwarzanie danych",
-    "Optymalizacja wydajności",
-    "Ogólne"
-]
-
 MODEL_OPTIONS = [
     {
         "id": "anthropic/claude-3.7-sonnet:floor",
@@ -145,18 +136,6 @@ class AssistantDB:
         )
         ''')
         
-        # Tabela bazy wiedzy
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS knowledge_items (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            content TEXT,
-            category TEXT,
-            tags TEXT,
-            created_at TIMESTAMP
-        )
-        ''')
-        
         self.conn.commit()
 
     def save_message(self, conversation_id: str, role: str, content: str, attachments=None) -> str:
@@ -258,90 +237,6 @@ class AssistantDB:
         cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         # Usuń konwersację
         cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-        self.conn.commit()
-
-    def save_knowledge_item(self, title: str, content: str, category: str, tags: List[str] = None) -> str:
-        """Zapisz element w bazie wiedzy"""
-        cursor = self.conn.cursor()
-        item_id = str(uuid.uuid4())
-        tags_json = json.dumps(tags or [])
-        
-        cursor.execute(
-            "INSERT INTO knowledge_items (id, title, content, category, tags, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (item_id, title, content, category, tags_json, datetime.now())
-        )
-        
-        self.conn.commit()
-        return item_id
-
-    def get_knowledge_items(self, category: str = None) -> List[Dict[str, Any]]:
-        """Pobierz wszystkie elementy bazy wiedzy, opcjonalnie filtrowane według kategorii"""
-        cursor = self.conn.cursor()
-        
-        if category and category != "Wszystkie":
-            cursor.execute(
-                "SELECT id, title, content, category, tags FROM knowledge_items WHERE category = ? ORDER BY created_at DESC",
-                (category,)
-            )
-        else:
-            cursor.execute(
-                "SELECT id, title, content, category, tags FROM knowledge_items ORDER BY created_at DESC"
-            )
-        
-        return [
-            {
-                "id": item_id,
-                "title": title,
-                "content": content,
-                "category": category,
-                "tags": json.loads(tags)
-            }
-            for item_id, title, content, category, tags in cursor.fetchall()
-        ]
-
-    def search_knowledge_base(self, query: str, category: str = None) -> List[Dict[str, Any]]:
-        """Przeszukaj bazę wiedzy według tekstu zapytania"""
-        cursor = self.conn.cursor()
-        search_term = f"%{query}%"
-        
-        if category and category != "Wszystkie":
-            cursor.execute(
-                "SELECT id, title, content, category, tags FROM knowledge_items WHERE (title LIKE ? OR content LIKE ?) AND category = ? ORDER BY created_at DESC",
-                (search_term, search_term, category)
-            )
-        else:
-            cursor.execute(
-                "SELECT id, title, content, category, tags FROM knowledge_items WHERE title LIKE ? OR content LIKE ? ORDER BY created_at DESC",
-                (search_term, search_term)
-            )
-        
-        return [
-            {
-                "id": item_id,
-                "title": title,
-                "content": content,
-                "category": category,
-                "tags": json.loads(tags)
-            }
-            for item_id, title, content, category, tags in cursor.fetchall()
-        ]
-
-    def delete_knowledge_item(self, item_id: str):
-        """Usuń element bazy wiedzy"""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM knowledge_items WHERE id = ?", (item_id,))
-        self.conn.commit()
-
-    def update_knowledge_item(self, item_id: str, title: str, content: str, category: str, tags: List[str] = None):
-        """Aktualizuj element bazy wiedzy"""
-        cursor = self.conn.cursor()
-        tags_json = json.dumps(tags or [])
-        
-        cursor.execute(
-            "UPDATE knowledge_items SET title = ?, content = ?, category = ?, tags = ? WHERE id = ?",
-            (title, content, category, tags_json, item_id)
-        )
-        
         self.conn.commit()
 
 # === Serwis LLM ===
@@ -498,94 +393,143 @@ def get_conversation_title(messages: List[Dict[str, str]], llm_service: LLMServi
     # Domyślnie użyj skróconej wiadomości użytkownika
     return user_message[:40] + ("..." if len(user_message) > 40 else "")
 
+# === Personalizacja interfejsu ===
+def apply_custom_css():
+    """Dodaj niestandardowy CSS do aplikacji"""
+    st.markdown("""
+    <style>
+    /* Styl dla kontenera wiadomości - wypełnia całą stronę */
+    .main .block-container {
+        padding-bottom: 5rem;  /* Miejsce na input na dole */
+    }
+    
+    /* Przytwierdzony pasek wprowadzania na dole ekranu */
+    .input-container {
+        position: fixed;
+        bottom: 0;
+        left: 0; 
+        right: 0;
+        background-color: white;
+        padding: 1rem;
+        box-shadow: 0 -2px 10px rgba(0,0,0,0.1);
+        z-index: 1000;
+    }
+    
+    /* Stylowanie załączników */
+    .attachment-button {
+        padding: 0.2rem 0.5rem;
+        font-size: 0.8rem;
+        border-radius: 999px;
+        background-color: #f0f2f6;
+        border: 1px solid #dfe1e5;
+        margin-right: 0.3rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 150px;
+    }
+    
+    /* Większa odległość od dołu ekranu przy wiadomościach */
+    .stChatMessage {
+        margin-bottom: 0.5rem;
+    }
+    
+    /* Przepełnienie dla długich bloków kodu */
+    .stChatMessage code {
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+    
+    .stChatMessage pre {
+        overflow-x: auto;
+        max-width: 100%;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 # === Komponenty interfejsu użytkownika ===
 def sidebar_component():
     """Komponent paska bocznego z konwersacjami i ustawieniami"""
     st.sidebar.title("AI Asystent Developera")
     
-    # Opcje nawigacji
-    page = st.sidebar.radio("Nawigacja", ["Chat Asystent", "Baza Wiedzy"])
-    
-    # Ustawienia modelu w sekcji Chat
-    if page == "Chat Asystent":
-        with st.sidebar.expander("⚙️ Ustawienia modelu", expanded=False):
-            model_options = {model["id"]: f"{model['name']}" for model in MODEL_OPTIONS}
-            selected_model = st.selectbox(
-                "Model LLM",
-                options=list(model_options.keys()),
-                format_func=lambda x: model_options[x],
-                index=0,
-                key="model_selection"
-            )
-            
-            # Pokaż opis modelu
-            for model in MODEL_OPTIONS:
-                if model["id"] == selected_model:
-                    st.info(model["description"])
-            
-            temperature = st.slider(
-                "Temperatura",
-                min_value=0.0,
-                max_value=1.0,
-                value=st.session_state.get("temperature", 0.7),
-                step=0.1,
-                help="Wyższa wartość = bardziej kreatywne odpowiedzi"
-            )
-            
-            st.session_state["temperature"] = temperature
-            
-            custom_system_prompt = st.text_area(
-                "Prompt systemowy (opcjonalnie)",
-                value=st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT),
-                help="Dostosuj zachowanie asystenta"
-            )
-            
-            if st.button("Zresetuj do domyślnego"):
-                custom_system_prompt = DEFAULT_SYSTEM_PROMPT
-            
-            st.session_state["custom_system_prompt"] = custom_system_prompt
+    # Ustawienia modelu
+    with st.sidebar.expander("⚙️ Ustawienia modelu", expanded=False):
+        model_options = {model["id"]: f"{model['name']}" for model in MODEL_OPTIONS}
+        selected_model = st.selectbox(
+            "Model LLM",
+            options=list(model_options.keys()),
+            format_func=lambda x: model_options[x],
+            index=0,
+            key="model_selection"
+        )
         
-        # Statystyki tokenów - przeniesione z głównego widoku do paska bocznego
-        if "token_usage" in st.session_state:
-            with st.sidebar.expander("📊 Statystyki tokenów", expanded=False):
-                st.metric("Tokeny prompt", st.session_state["token_usage"]["prompt"])
-                st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
-                st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
+        # Pokaż opis modelu
+        for model in MODEL_OPTIONS:
+            if model["id"] == selected_model:
+                st.info(model["description"])
         
-        # Lista konwersacji
-        db = st.session_state.get("db")
-        if db:
-            with st.sidebar.expander("💬 Konwersacje", expanded=True):
-                conversations = db.get_conversations()
-                
-                if conversations:
-                    for conv in conversations:
-                        col1, col2 = st.columns([4, 1])
-                        with col1:
-                            if st.button(conv["title"], key=f"conv_{conv['id']}", use_container_width=True):
-                                st.session_state["current_conversation_id"] = conv["id"]
-                                st.rerun()
-                        with col2:
-                            if st.button("🗑️", key=f"del_{conv['id']}", help="Usuń konwersację"):
-                                db.delete_conversation(conv["id"])
-                                if st.session_state.get("current_conversation_id") == conv["id"]:
-                                    st.session_state["current_conversation_id"] = None
-                                st.rerun()
-                else:
-                    st.write("Brak zapisanych konwersacji")
-            
-            # Przycisk nowej konwersacji
-            if st.sidebar.button("➕ Nowa konwersacja", use_container_width=True):
-                st.session_state["current_conversation_id"] = str(uuid.uuid4())
-                st.rerun()
+        temperature = st.slider(
+            "Temperatura",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.get("temperature", 0.7),
+            step=0.1,
+            help="Wyższa wartość = bardziej kreatywne odpowiedzi"
+        )
+        
+        st.session_state["temperature"] = temperature
+        
+        custom_system_prompt = st.text_area(
+            "Prompt systemowy (opcjonalnie)",
+            value=st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT),
+            help="Dostosuj zachowanie asystenta"
+        )
+        
+        if st.button("Zresetuj do domyślnego"):
+            custom_system_prompt = DEFAULT_SYSTEM_PROMPT
+        
+        st.session_state["custom_system_prompt"] = custom_system_prompt
     
-    return page
+    # Statystyki tokenów
+    if "token_usage" in st.session_state:
+        with st.sidebar.expander("📊 Statystyki tokenów", expanded=False):
+            st.metric("Tokeny prompt", st.session_state["token_usage"]["prompt"])
+            st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
+            st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
+    
+    # Lista konwersacji
+    db = st.session_state.get("db")
+    if db:
+        with st.sidebar.expander("💬 Konwersacje", expanded=True):
+            conversations = db.get_conversations()
+            
+            if conversations:
+                for conv in conversations:
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        if st.button(conv["title"], key=f"conv_{conv['id']}", use_container_width=True):
+                            st.session_state["current_conversation_id"] = conv["id"]
+                            st.rerun()
+                    with col2:
+                        if st.button("🗑️", key=f"del_{conv['id']}", help="Usuń konwersację"):
+                            db.delete_conversation(conv["id"])
+                            if st.session_state.get("current_conversation_id") == conv["id"]:
+                                st.session_state["current_conversation_id"] = None
+                            st.rerun()
+            else:
+                st.write("Brak zapisanych konwersacji")
+        
+        # Przycisk nowej konwersacji
+        if st.sidebar.button("➕ Nowa konwersacja", use_container_width=True):
+            st.session_state["current_conversation_id"] = str(uuid.uuid4())
+            st.rerun()
 
 @requires_auth
 def chat_component():
     """Komponent interfejsu czatu"""
-    # Usunięcie nagłówka tytułowego
-
+    # Dodaj niestandardowy CSS
+    apply_custom_css()
+    
     # Pobierz klucz API z secrets
     api_key = st.secrets.get("OPENROUTER_API_KEY", "")
     if not api_key:
@@ -612,93 +556,91 @@ def chat_component():
 
     current_conversation_id = st.session_state["current_conversation_id"]
 
-    # Statystyki konwersacji - przeniesione do paska bocznego
+    # Statystyki konwersacji
     if "token_usage" not in st.session_state:
         st.session_state["token_usage"] = {"prompt": 0, "completion": 0, "cost": 0.0}
-
-    # Pobierz wiadomości
-    messages = db.get_messages(current_conversation_id)
-
-    # Wyświetl istniejące wiadomości - teraz na całej szerokości strony
-    for message in messages:
-        role = message["role"]
-        content = format_message_for_display(message)
-
-        if role == "user":
-            with st.chat_message("user"):
-                st.markdown(content)
-                # Wyświetl załączniki jeśli istnieją - tylko obrazy, bez wyświetlania tekstu załączników
-                for attachment in message.get("attachments", []):
-                    if attachment.get("type") == "image":
-                        try:
-                            # Załączniki obrazów są trzymane w sesji, a nie w DB
-                            if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
-                                img_data = st.session_state["attached_images"][attachment.get("name")]
-                                st.image(img_data, caption=attachment.get("name", "Załącznik"))
-                        except Exception as e:
-                            st.error(f"Nie można wyświetlić obrazu: {str(e)}")
-
-        elif role == "assistant":
-            with st.chat_message("assistant"):
-                st.markdown(content)
-
+    
     # Inicjalizacja zmiennych dla załączników
     if "attachments" not in st.session_state:
         st.session_state["attachments"] = []
 
     if "attached_images" not in st.session_state:
         st.session_state["attached_images"] = {}
-
-    # Integracja załączników z polem wprowadzania - kompaktowy widok
-    # Pole wprowadzania z przyciskami załączników obok
+        
+    # Tworzymy placeholder dla wiadomości - będą wyświetlane tu
+    messages_container = st.container()
+    
+    # Pobierz wiadomości z DB
+    messages = db.get_messages(current_conversation_id)
+    
+    # Obsługa nowej wiadomości użytkownika
+    # Najpierw umieszczamy kontener formularza wejściowego (będzie na dole)
+    st.markdown('<div class="input-container" id="input-container">', unsafe_allow_html=True)
+        
+    # Input użytkownika i przyciski załączników
     col1, col2 = st.columns([6, 1])
     
     with col1:
         user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
 
     with col2:
-        st.markdown("<div style='height: 24px'></div>", unsafe_allow_html=True)  # Spacer dla wyrównania z polem wprowadzania
+        # Przyciski załączników w małej kolumnie obok pola czatu
         attachment_col1, attachment_col2, attachment_col3 = st.columns(3)
-        
         with attachment_col1:
-            if st.button("📷", help="Dodaj obraz"):
+            if st.button("📷", help="Dodaj obraz", key="btn_img"):
                 st.session_state["show_image_uploader"] = not st.session_state.get("show_image_uploader", False)
                 st.rerun()
                 
         with attachment_col2:
-            if st.button("📄", help="Dodaj plik"):
+            if st.button("📄", help="Dodaj plik", key="btn_file"):
                 st.session_state["show_file_uploader"] = not st.session_state.get("show_file_uploader", False)
                 st.rerun()
                 
         with attachment_col3:
-            if st.button("💻", help="Dodaj kod"):
+            if st.button("💻", help="Dodaj kod", key="btn_code"):
                 st.session_state["show_code_input"] = not st.session_state.get("show_code_input", False)
                 st.rerun()
 
-    # Pokaż liczbę załączników
+    # Wyświetl liczbę załączników jako małe etykiety
     if st.session_state["attachments"]:
-        st.caption(f"Załączniki: {len(st.session_state['attachments'])}")
-        
-        # Pokaż załączniki w jednej linii jako przyciski do usunięcia
-        cols = st.columns(min(4, len(st.session_state["attachments"])))
+        st.caption(f"Załączników: {len(st.session_state['attachments'])}")
+        # Przyciski załączników jako inline elementy
+        attachment_html = ""
         for i, attachment in enumerate(st.session_state["attachments"]):
-            with cols[i % len(cols)]:
-                if st.button(f"❌ {attachment.get('name', 'Załącznik')[:10]}...", key=f"remove_{i}"):
-                    # Jeśli to obraz, usuń też z pamięci sesji
-                    if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
-                        del st.session_state["attached_images"][attachment.get("name")]
-                    st.session_state["attachments"].pop(i)
-                    st.rerun()
+            attachment_name = attachment.get('name', 'Załącznik')[:10] + (attachment.get('name', 'Załącznik')[10:] and '...')
+            attachment_html += f"""
+            <button class="attachment-button" onclick="removeAttachment({i})" title="Kliknij, aby usunąć">
+                {"📷" if attachment.get("type") == "image" else "📄"} {attachment_name}
+            </button>
+            """
+        
+        st.markdown(f"""
+        <div>{attachment_html}</div>
+        <script>
+        function removeAttachment(index) {{
+            // Symuluj kliknięcie odpowiedniego niewidocznego przycisku
+            document.getElementById('remove_' + index).click();
+        }}
+        </script>
+        """, unsafe_allow_html=True)
+        
+        # Niewidoczne przyciski do usuwania załączników
+        for i, attachment in enumerate(st.session_state["attachments"]):
+            if st.button("Usuń", key=f"remove_{i}", help="Usuń załącznik", visible=False):
+                if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
+                    del st.session_state["attached_images"][attachment.get("name")]
+                st.session_state["attachments"].pop(i)
+                st.rerun()
 
     # Formularze załączników - pokazywane tylko gdy użytkownik kliknie odpowiedni przycisk
     if st.session_state.get("show_image_uploader", False):
         with st.expander("Dodaj obraz", expanded=True):
             uploaded_file = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_upload")
             if uploaded_file is not None and st.button("Dodaj"):
-                # Zapisujemy obraz w pamięci sesji, a nie w załącznikach
+                # Zapisujemy obraz w pamięci sesji
                 image_name = uploaded_file.name
                 st.session_state["attached_images"][image_name] = uploaded_file.getvalue()
-
+                
                 # Do załączników dodajemy tylko referencję
                 st.session_state["attachments"].append({
                     "type": "image",
@@ -740,9 +682,51 @@ def chat_component():
                 st.session_state["show_code_input"] = False
                 st.success(f"Dodano kod: {file_name}")
                 st.rerun()
+                
+    # Zamknięcie kontenera wejściowego
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Teraz wyświetlamy wiadomości we wcześniej utworzonym kontenerze
+    with messages_container:
+        # Wyświetl istniejące wiadomości
+        for message in messages:
+            role = message["role"]
+            content = format_message_for_display(message)
 
-    # Obsługa wprowadzenia użytkownika
+            if role == "user":
+                with st.chat_message("user"):
+                    st.markdown(content)
+                    # Wyświetl załączniki jeśli istnieją - tylko obrazy, bez wyświetlania tekstu załączników
+                    for attachment in message.get("attachments", []):
+                        if attachment.get("type") == "image":
+                            try:
+                                # Załączniki obrazów są trzymane w sesji, a nie w DB
+                                if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
+                                    img_data = st.session_state["attached_images"][attachment.get("name")]
+                                    st.image(img_data, caption=attachment.get("name", "Załącznik"))
+                            except Exception as e:
+                                st.error(f"Nie można wyświetlić obrazu: {str(e)}")
+
+            elif role == "assistant":
+                with st.chat_message("assistant"):
+                    st.markdown(content)
+
+    # Obsługa wprowadzonej wiadomości - po user_input, ale przed końcem funkcji
     if user_input:
+        # Natychmiast wyświetl wiadomość użytkownika
+        with messages_container:
+            with st.chat_message("user"):
+                st.markdown(user_input)
+                # Pokaż załączniki
+                for attachment in st.session_state.get("attachments", []):
+                    if attachment.get("type") == "image":
+                        try:
+                            if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
+                                img_data = st.session_state["attached_images"][attachment.get("name")]
+                                st.image(img_data, caption=attachment.get("name", "Załącznik"))
+                        except Exception as e:
+                            st.error(f"Nie można wyświetlić obrazu: {str(e)}")
+        
         # Przygotuj treść wiadomości i załączniki
         message_content = user_input
 
@@ -752,7 +736,7 @@ def chat_component():
             attachment_copy = attachment.copy()
             attachments_to_send.append(attachment_copy)
 
-        # Dodaj informacje o załącznikach do treści wiadomości
+        # Dodaj informacje o załącznikach do treści wiadomości 
         if attachments_to_send:
             attachment_descriptions = []
             for attachment in attachments_to_send:
@@ -769,7 +753,7 @@ def chat_component():
             conversation_title = get_conversation_title([{"role": "user", "content": user_input}], llm_service, st.session_state["api_key"])
             db.save_conversation(current_conversation_id, conversation_title)
 
-        # Zapisz wiadomość użytkownika
+        # Zapisz wiadomość użytkownika w bazie danych
         db.save_message(current_conversation_id, "user", user_input, attachments_to_send)
 
         # Przygotuj wiadomości dla API
@@ -783,155 +767,56 @@ def chat_component():
         # Dodaj aktualną wiadomość użytkownika
         api_messages.append({"role": "user", "content": message_content})
 
-        # Uzyskaj odpowiedź asystenta
-        with st.spinner("Generowanie odpowiedzi..."):
-            try:
-                model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
-                system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
-                temperature = st.session_state.get("temperature", 0.7)
+        # Pokaż spinner podczas oczekiwania na odpowiedź
+        with messages_container:
+            with st.chat_message("assistant"):
+                with st.spinner("Generowanie odpowiedzi..."):
+                    try:
+                        model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
+                        system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
+                        temperature = st.session_state.get("temperature", 0.7)
 
-                response = llm_service.call_llm(
-                    messages=api_messages,
-                    model=model,
-                    system_prompt=system_prompt,
-                    temperature=temperature,
-                    max_tokens=8000  # Zwiększenie dla dłuższych odpowiedzi
-                )
+                        response = llm_service.call_llm(
+                            messages=api_messages,
+                            model=model,
+                            system_prompt=system_prompt,
+                            temperature=temperature,
+                            max_tokens=8000
+                        )
 
-                assistant_response = response["choices"][0]["message"]["content"]
+                        assistant_response = response["choices"][0]["message"]["content"]
 
-                # Aktualizuj statystyki tokenów
-                if "usage" in response:
-                    usage = response["usage"]
-                    st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
-                    st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+                        # Aktualizuj statystyki tokenów
+                        if "usage" in response:
+                            usage = response["usage"]
+                            st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
+                            st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
 
-                    # Oblicz koszt
-                    cost = calculate_cost(
-                        model, 
-                        usage["prompt_tokens"], 
-                        usage["completion_tokens"]
-                    )
+                            # Oblicz koszt
+                            cost = calculate_cost(
+                                model, 
+                                usage["prompt_tokens"], 
+                                usage["completion_tokens"]
+                            )
 
-                    st.session_state["token_usage"]["cost"] += cost
+                            st.session_state["token_usage"]["cost"] += cost
 
-                # Zapisz odpowiedź asystenta
-                db.save_message(current_conversation_id, "assistant", assistant_response)
-
-                # Wyczyść załączniki po wysłaniu
-                st.session_state["attachments"] = []
-                # Ukryj wszystkie formularze załączników
-                st.session_state["show_image_uploader"] = False
-                st.session_state["show_file_uploader"] = False  
-                st.session_state["show_code_input"] = False
-                
-                # Odśwież stronę, aby wyświetlić nową wiadomość
-                st.rerun()
-                
-            except Exception as e:
-                st.error(f"Wystąpił błąd: {str(e)}")
-                st.error("Szczegóły: " + str(type(e)))
-
-@requires_auth
-def knowledge_base_component():
-    """Komponent bazy wiedzy"""
-    st.title("📚 Baza Wiedzy")
-    
-    db = st.session_state.get("db")
-    if not db:
-        st.error("⚠️ Nie można zainicjalizować bazy danych. Odśwież stronę i spróbuj ponownie.")
-        return
-    
-    tab1, tab2 = st.tabs(["Przeglądaj", "Dodaj nowy"])
-    
-    with tab1:
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
-            search_query = st.text_input("🔍 Szukaj w bazie wiedzy", placeholder="Wpisz zapytanie...")
-        
-        with col2:
-            categories = ["Wszystkie"] + KNOWLEDGE_CATEGORIES
-            selected_category = st.selectbox("Kategoria", categories)
-        
-        # Pobierz i wyświetl elementy bazy wiedzy
-        if search_query:
-            items = db.search_knowledge_base(search_query, selected_category if selected_category != "Wszystkie" else None)
-        else:
-            items = db.get_knowledge_items(selected_category if selected_category != "Wszystkie" else None)
-        
-        if not items:
-            st.info("Nie znaleziono pasujących elementów bazy wiedzy.")
-        else:
-            for item in items:
-                with st.expander(f"**{item['title']}** ({item['category']})"):
-                    st.markdown(item["content"])
-                    
-                    col1, col2 = st.columns([1, 6])
-                    with col1:
-                        if st.button("Usuń", key=f"del_kb_{item['id']}", help="Usuń ten element z bazy wiedzy"):
-                            db.delete_knowledge_item(item["id"])
-                            st.success("Element usunięty!")
-                            st.rerun()
-                    
-                    with col2:
-                        if st.button("Edytuj", key=f"edit_kb_{item['id']}", help="Edytuj ten element"):
-                            st.session_state["editing_item"] = item
-                            st.rerun()
-    
-    with tab2:
-        # Edycja istniejącego elementu
-        editing_item = st.session_state.get("editing_item")
-        
-        if editing_item:
-            st.subheader("Edytuj element bazy wiedzy")
-            item_title = st.text_input("Tytuł", value=editing_item["title"])
-            item_category = st.selectbox("Kategoria", KNOWLEDGE_CATEGORIES, index=KNOWLEDGE_CATEGORIES.index(editing_item["category"]) if editing_item["category"] in KNOWLEDGE_CATEGORIES else 0)
-            item_content = st.text_area("Zawartość (wspierane Markdown)", value=editing_item["content"], height=300)
-            item_tags = st.multiselect("Tagi (opcjonalnie)", options=["Kod", "Komponent", "Integracja", "Design"], default=editing_item["tags"])
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Anuluj edycję"):
-                    st.session_state.pop("editing_item", None)
-                    st.rerun()
-            
-            with col2:
-                if st.button("Zapisz zmiany"):
-                    db.update_knowledge_item(
-                        editing_item["id"],
-                        item_title,
-                        item_content,
-                        item_category,
-                        item_tags
-                    )
-                    st.success("Element zaktualizowany!")
-                    st.session_state.pop("editing_item", None)
-                    st.rerun()
-        
-        # Dodawanie nowego elementu
-        else:
-            st.subheader("Dodaj nowy element do bazy wiedzy")
-            item_title = st.text_input("Tytuł", placeholder="Np. Komponent wyboru plików z podglądem")
-            item_category = st.selectbox("Kategoria", KNOWLEDGE_CATEGORIES)
-            item_content = st.text_area("Zawartość (wspierane Markdown)", placeholder="Wpisz zawartość, kod, fragmenty...", height=300)
-            item_tags = st.multiselect("Tagi (opcjonalnie)", options=["Kod", "Komponent", "Integracja", "Design"])
-            
-            if st.button("Dodaj do bazy wiedzy"):
-                if item_title and item_content:
-                    db.save_knowledge_item(
-                        item_title,
-                        item_content,
-                        item_category,
-                        item_tags
-                    )
-                    st.success("Dodano do bazy wiedzy!")
-                    # Wyczyść pola po dodaniu
-                    st.session_state["new_item_title"] = ""
-                    st.session_state["new_item_content"] = ""
-                    st.rerun()
-                else:
-                    st.error("Tytuł i zawartość są wymagane.")
+                        # Zapisz odpowiedź asystenta
+                        db.save_message(current_conversation_id, "assistant", assistant_response)
+                        
+                        # Wyświetl odpowiedź
+                        st.markdown(assistant_response)
+                        
+                        # Wyczyść załączniki po wysłaniu
+                        st.session_state["attachments"] = []
+                        # Ukryj formularze załączników
+                        st.session_state["show_image_uploader"] = False
+                        st.session_state["show_file_uploader"] = False  
+                        st.session_state["show_code_input"] = False
+                        
+                    except Exception as e:
+                        st.error(f"Wystąpił błąd: {str(e)}")
+                        st.error("Szczegóły: " + str(type(e)))
 
 # === Główna aplikacja ===
 def main():
@@ -958,13 +843,10 @@ def main():
         st.session_state["api_key"] = api_key
     
     # Wyświetl sidebar
-    page = sidebar_component()
+    sidebar_component()
     
-    # Wyświetl główny komponent
-    if page == "Chat Asystent":
-        chat_component()
-    elif page == "Baza Wiedzy":
-        knowledge_base_component()
+    # Wyświetl główny komponent czatu
+    chat_component()
 
 if __name__ == "__main__":
     main()
