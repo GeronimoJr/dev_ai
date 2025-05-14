@@ -10,6 +10,7 @@ from datetime import datetime
 import tiktoken
 from typing import List, Dict, Any, Optional
 import hashlib
+from functools import wraps
 
 # === Konfiguracja ===
 KNOWLEDGE_CATEGORIES = [
@@ -29,10 +30,22 @@ MODEL_OPTIONS = [
         "description": "Zalecany - Najnowszy model Claude z doskonałymi umiejętnościami kodowania"
     },
     {
+        "id": "anthropic/claude-3.7-haiku-thinking",
+        "name": "Claude 3.7 Thinking",
+        "pricing": {"prompt": 3.0, "completion": 15.0},
+        "description": "Model Claude wykorzystujący dodatkowy czas na analizę problemów"
+    },
+    {
         "id": "openai/gpt-4o",
         "name": "GPT-4o",
         "pricing": {"prompt": 2.5, "completion": 10.0},
         "description": "Silna alternatywa z dobrymi zdolnościami kodowania"
+    },
+    {
+        "id": "openai/gpt-4-turbo",
+        "name": "GPT-4 Turbo",
+        "pricing": {"prompt": 2.5, "completion": 10.0},
+        "description": "Nieco starszy model GPT-4 Turbo"
     },
     {
         "id": "anthropic/claude-3.5-haiku",
@@ -60,7 +73,41 @@ Gdy podajesz przykłady kodu, przestrzegaj tych zasad:
 
 Zawsze dziel aplikacje na logiczne komponenty i funkcje, zamiast pisać wszystko w jednym bloku kodu.
 Pamiętaj o zarządzaniu stanem sesji w Streamlit i optymalizacji kosztów przy korzystaniu z API modeli językowych.
+:floordevai.txt:
 """
+
+# === Funkcja dekoratora dla autoryzacji ===
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not st.session_state.get("authenticated", False):
+            return login_page()
+        return f(*args, **kwargs)
+    return decorated
+
+def login_page():
+    """Strona logowania"""
+    st.title("🔒 Logowanie")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("### Zaloguj się, aby uzyskać dostęp")
+        
+        username = st.text_input("Nazwa użytkownika", key="login_username")
+        password = st.text_input("Hasło", type="password", key="login_password")
+        
+        if st.button("Zaloguj"):
+            # Pobierz ustawienia z secrets
+            correct_username = st.secrets.get("APP_USER", "admin")
+            correct_password = st.secrets.get("APP_PASSWORD", "password")
+            
+            if username == correct_username and password == correct_password:
+                st.session_state["authenticated"] = True
+                st.success("Zalogowano pomyślnie!")
+                st.rerun()
+            else:
+                st.error("Nieprawidłowa nazwa użytkownika lub hasło!")
 
 # === Zarządzanie bazą danych ===
 class AssistantDB:
@@ -91,6 +138,7 @@ class AssistantDB:
             role TEXT,
             content TEXT,
             timestamp TIMESTAMP,
+            attachments TEXT,
             FOREIGN KEY (conversation_id) REFERENCES conversations (id)
         )
         ''')
@@ -109,13 +157,14 @@ class AssistantDB:
         
         self.conn.commit()
 
-    def save_message(self, conversation_id: str, role: str, content: str) -> str:
+    def save_message(self, conversation_id: str, role: str, content: str, attachments: List[Dict] = None) -> str:
         """Zapisz wiadomość w bazie danych"""
         cursor = self.conn.cursor()
         message_id = str(uuid.uuid4())
+        attachments_json = json.dumps(attachments or [])
         cursor.execute(
-            "INSERT INTO messages (id, conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (message_id, conversation_id, role, content, datetime.now())
+            "INSERT INTO messages (id, conversation_id, role, content, timestamp, attachments) VALUES (?, ?, ?, ?, ?, ?)",
+            (message_id, conversation_id, role, content, datetime.now(), attachments_json)
         )
         self.conn.commit()
         return message_id
@@ -124,10 +173,17 @@ class AssistantDB:
         """Pobierz wszystkie wiadomości dla konwersacji"""
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp",
+            "SELECT role, content, attachments FROM messages WHERE conversation_id = ? ORDER BY timestamp",
             (conversation_id,)
         )
-        return [{"role": role, "content": content} for role, content in cursor.fetchall()]
+        return [
+            {
+                "role": role, 
+                "content": content, 
+                "attachments": json.loads(attachments) if attachments else []
+            } 
+            for role, content, attachments in cursor.fetchall()
+        ]
 
     def save_conversation(self, conversation_id: str, title: str):
         """Utwórz lub zaktualizuj konwersację"""
@@ -417,18 +473,6 @@ def sidebar_component():
     # Opcje nawigacji
     page = st.sidebar.radio("Nawigacja", ["Chat Asystent", "Baza Wiedzy"])
     
-    # Ustawienia API
-    with st.sidebar.expander("🔑 Ustawienia API", expanded=False):
-        api_key = st.text_input(
-            "Klucz API OpenRouter",
-            value=st.session_state.get("api_key", ""),
-            type="password",
-            help="Wprowadź swój klucz API OpenRouter"
-        )
-        
-        if api_key:
-            st.session_state["api_key"] = api_key
-    
     # Ustawienia modelu w sekcji Chat
     if page == "Chat Asystent":
         with st.sidebar.expander("⚙️ Ustawienia modelu", expanded=False):
@@ -497,16 +541,24 @@ def sidebar_component():
     
     return page
 
+@requires_auth
 def chat_component():
     """Komponent interfejsu czatu"""
     st.title("💬 Chat Asystent Developera Streamlit")
     
-    # Sprawdź, czy klucz API jest ustawiony
-    if not st.session_state.get("api_key"):
-        st.warning("⚠️ Wprowadź swój klucz API OpenRouter w ustawieniach, aby korzystać z asystenta.")
+    # Pobierz klucz API z secrets
+    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        st.warning("⚠️ Brak klucza API OpenRouter w ustawieniach secrets.")
         return
     
+    # Aktualizuj klucz API w sesji
+    st.session_state["api_key"] = api_key
+    
     # Pobierz instancję serwisu LLM i bazy danych
+    if "llm_service" not in st.session_state or st.session_state.get("llm_service") is None:
+        st.session_state["llm_service"] = LLMService(api_key)
+    
     llm_service = st.session_state.get("llm_service")
     db = st.session_state.get("db")
     
@@ -533,94 +585,216 @@ def chat_component():
         with col3:
             st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
     
+    # Kontener na historię czatu z możliwością przewijania
+    chat_container = st.container()
+    
+    # Kontener na pola wprowadzania (zawsze na dole)
+    input_container = st.container()
+    
     # Wyświetl istniejące wiadomości
     messages = db.get_messages(current_conversation_id)
     
-    if not messages:
-        # Komunikat powitalny dla nowej konwersacji
-        st.markdown(""" 
-        ### 👋 Witaj w Asystencie Developera Streamlit!
-        
-        Jestem tu, aby pomóc Ci projektować i tworzyć aplikacje Streamlit z wykorzystaniem AI. 
-        Możesz zadać mi pytania dotyczące:
-        
-        - Projektowania interfejsu użytkownika w Streamlit
-        - Implementacji funkcjonalności AI w aplikacjach
-        - Integracji z APIami (OpenRouter, OpenAI, Anthropic, itp.)
-        - Optymalizacji wydajności i kosztów
-        - Przykładów kodu i komponentów
-        
-        Zacznij od opisania aplikacji, którą chcesz stworzyć lub zapytaj o konkretne rozwiązanie.
-        """)
-    else:
-        for message in messages:
-            role = message["role"]
-            content = format_message_for_display(message)
+    with chat_container:
+        if not messages:
+            # Komunikat powitalny dla nowej konwersacji
+            st.markdown(""" 
+            ### 👋 Witaj w Asystencie Developera Streamlit!
             
-            if role == "user":
-                st.chat_message("user").markdown(content)
-            elif role == "assistant":
-                with st.chat_message("assistant"):
-                    st.markdown(content)
+            Jestem tu, aby pomóc Ci projektować i tworzyć aplikacje Streamlit z wykorzystaniem AI. 
+            Możesz zadać mi pytania dotyczące:
+            
+            - Projektowania interfejsu użytkownika w Streamlit
+            - Implementacji funkcjonalności AI w aplikacjach
+            - Integracji z APIami (OpenRouter, OpenAI, Anthropic, itp.)
+            - Optymalizacji wydajności i kosztów
+            - Przykładów kodu i komponentów
+            
+            Zacznij od opisania aplikacji, którą chcesz stworzyć lub zapytaj o konkretne rozwiązanie.
+            """)
+        else:
+            for message in messages:
+                role = message["role"]
+                content = format_message_for_display(message)
+                attachments = message.get("attachments", [])
+                
+                if role == "user":
+                    with st.chat_message("user"):
+                        st.markdown(content)
+                        # Wyświetl załączniki
+                        for attachment in attachments:
+                            if attachment.get("type") == "image":
+                                st.image(attachment.get("data"), caption=attachment.get("name", "Załącznik"))
+                            elif attachment.get("type") == "file":
+                                st.download_button(
+                                    label=f"📎 {attachment.get('name', 'Pobierz załącznik')}",
+                                    data=attachment.get("data"),
+                                    file_name=attachment.get("name", "attachment.txt"),
+                                )
+                elif role == "assistant":
+                    with st.chat_message("assistant"):
+                        st.markdown(content)
     
-    # Input użytkownika
-    prompt = st.chat_input("Wpisz swoje pytanie lub zadanie...")
-    
-    if prompt:
-        # Sprawdź, czy konwersacja ma tytuł
-        if len(messages) == 0:
-            conversation_title = get_conversation_title([{"role": "user", "content": prompt}], llm_service, st.session_state["api_key"])
-            db.save_conversation(current_conversation_id, conversation_title)
+    # Sekcja załączników i wiadomości na dole ekranu
+    with input_container:
+        # Kontener na załączniki
+        if "attachments" not in st.session_state:
+            st.session_state["attachments"] = []
         
-        # Wyświetl wiadomość użytkownika
-        st.chat_message("user").markdown(prompt)
+        # Wyświetl aktualnie dodane załączniki
+        if st.session_state["attachments"]:
+            st.write("Załączniki do wysłania:")
+            cols = st.columns(4)
+            for i, attachment in enumerate(st.session_state["attachments"]):
+                with cols[i % 4]:
+                    st.write(f"📎 {attachment.get('name', 'Załącznik')}")
+                    if st.button("Usuń", key=f"remove_{i}"):
+                        st.session_state["attachments"].pop(i)
+                        st.rerun()
         
-        # Zapisz wiadomość użytkownika
-        db.save_message(current_conversation_id, "user", prompt)
-        
-        # Przygotuj wiadomości dla API
-        api_messages = db.get_messages(current_conversation_id)
-        
-        # Uzyskaj odpowiedź asystenta
-        with st.spinner("Generowanie odpowiedzi..."):
-            try:
-                model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
-                system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
-                temperature = st.session_state.get("temperature", 0.7)
+        # Dodaj załączniki
+        with st.expander("📎 Dodaj załącznik", expanded=False):
+            attachment_type = st.radio("Typ załącznika", ["Obraz", "Plik tekstowy", "Kod"])
+            
+            if attachment_type == "Obraz":
+                uploaded_file = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_upload")
+                if uploaded_file is not None and st.button("Dodaj obraz"):
+                    bytes_data = uploaded_file.getvalue()
+                    st.session_state["attachments"].append({
+                        "type": "image",
+                        "name": uploaded_file.name,
+                        "data": bytes_data
+                    })
+                    st.success(f"Dodano obraz: {uploaded_file.name}")
+                    st.rerun()
+            
+            elif attachment_type == "Plik tekstowy":
+                uploaded_file = st.file_uploader("Wybierz plik", type=["txt", "md", "json", "csv"], key="text_upload")
+                if uploaded_file is not None and st.button("Dodaj plik"):
+                    bytes_data = uploaded_file.getvalue()
+                    try:
+                        text_content = bytes_data.decode("utf-8")
+                        st.session_state["attachments"].append({
+                            "type": "file",
+                            "name": uploaded_file.name,
+                            "data": bytes_data,
+                            "text_content": text_content
+                        })
+                        st.success(f"Dodano plik: {uploaded_file.name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Błąd odczytu pliku: {str(e)}")
+            
+            elif attachment_type == "Kod":
+                code_language = st.selectbox("Język programowania", ["python", "javascript", "html", "css", "json", "sql", "bash"])
+                code_content = st.text_area("Wklej kod", height=150)
+                file_name = st.text_input("Nazwa pliku (opcjonalnie)", value=f"code.{code_language}")
                 
-                response = llm_service.call_llm(
-                    messages=api_messages,
-                    model=model,
-                    system_prompt=system_prompt,
-                    temperature=temperature
-                )
+                if code_content and st.button("Dodaj kod"):
+                    st.session_state["attachments"].append({
+                        "type": "file",
+                        "name": file_name,
+                        "data": code_content.encode("utf-8"),
+                        "text_content": f"```{code_language}\n{code_content}\n```"
+                    })
+                    st.success(f"Dodano kod: {file_name}")
+                    st.rerun()
+        
+        # Input użytkownika
+        user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
+        
+        if user_input:
+            # Przygotuj treść wiadomości i załączniki
+            message_content = user_input
+            attachments_to_send = st.session_state.get("attachments", [])
+            
+            # Dodaj informacje o załącznikach do treści wiadomości
+            if attachments_to_send:
+                attachment_descriptions = []
+                for attachment in attachments_to_send:
+                    if attachment.get("type") == "image":
+                        attachment_descriptions.append(f"[Załącznik obrazu: {attachment.get('name', 'image')}]")
+                    elif attachment.get("type") == "file" and attachment.get("text_content"):
+                        attachment_descriptions.append(f"[Załącznik pliku: {attachment.get('name', 'file')}]\n{attachment.get('text_content')}")
                 
-                assistant_response = response["choices"][0]["message"]["content"]
-                
-                # Aktualizuj statystyki tokenów
-                if "usage" in response:
-                    usage = response["usage"]
-                    st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
-                    st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+                if attachment_descriptions:
+                    message_content += "\n\n" + "\n\n".join(attachment_descriptions)
+            
+            # Sprawdź, czy konwersacja ma tytuł
+            if len(messages) == 0:
+                conversation_title = get_conversation_title([{"role": "user", "content": user_input}], llm_service, st.session_state["api_key"])
+                db.save_conversation(current_conversation_id, conversation_title)
+            
+            # Wyświetl wiadomość użytkownika
+            with st.chat_message("user"):
+                st.markdown(user_input)
+                # Wyświetl załączniki
+                for attachment in attachments_to_send:
+                    if attachment.get("type") == "image":
+                        st.image(attachment.get("data"), caption=attachment.get("name", "Załącznik"))
+                    elif attachment.get("type") == "file":
+                        st.download_button(
+                            label=f"📎 {attachment.get('name', 'Pobierz załącznik')}",
+                            data=attachment.get("data"),
+                            file_name=attachment.get("name", "attachment.txt"),
+                        )
+            
+            # Zapisz wiadomość użytkownika
+            db.save_message(current_conversation_id, "user", user_input, attachments_to_send)
+            
+            # Przygotuj wiadomości dla API
+            api_messages = db.get_messages(current_conversation_id)
+            
+            # Konwertuj format wiadomości na ten oczekiwany przez API
+            api_messages_formatted = []
+            for msg in api_messages:
+                api_msg = {"role": msg["role"], "content": msg["content"]}
+                api_messages_formatted.append(api_msg)
+            
+            # Uzyskaj odpowiedź asystenta
+            with st.spinner("Generowanie odpowiedzi..."):
+                try:
+                    model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
+                    system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
+                    temperature = st.session_state.get("temperature", 0.7)
                     
-                    # Oblicz koszt
-                    cost = calculate_cost(
-                        model, 
-                        usage["prompt_tokens"], 
-                        usage["completion_tokens"]
+                    response = llm_service.call_llm(
+                        messages=api_messages_formatted,
+                        model=model,
+                        system_prompt=system_prompt,
+                        temperature=temperature
                     )
                     
-                    st.session_state["token_usage"]["cost"] += cost
-                
-                # Wyświetl odpowiedź asystenta
-                with st.chat_message("assistant"):
-                    st.markdown(assistant_response)
-                
-                # Zapisz odpowiedź asystenta
-                db.save_message(current_conversation_id, "assistant", assistant_response)
-                
-            except Exception as e:
-                st.error(f"Wystąpił błąd: {str(e)}")
+                    assistant_response = response["choices"][0]["message"]["content"]
+                    
+                    # Aktualizuj statystyki tokenów
+                    if "usage" in response:
+                        usage = response["usage"]
+                        st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
+                        st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+                        
+                        # Oblicz koszt
+                        cost = calculate_cost(
+                            model, 
+                            usage["prompt_tokens"], 
+                            usage["completion_tokens"]
+                        )
+                        
+                        st.session_state["token_usage"]["cost"] += cost
+                    
+                    # Wyświetl odpowiedź asystenta
+                    with st.chat_message("assistant"):
+                        st.markdown(assistant_response)
+                    
+                    # Zapisz odpowiedź asystenta
+                    db.save_message(current_conversation_id, "assistant", assistant_response)
+                    
+                    # Wyczyść załączniki po wysłaniu
+                    st.session_state["attachments"] = []
+                    
+                except Exception as e:
+                    st.error(f"Wystąpił błąd: {str(e)}")
+
+@requires_auth
 def knowledge_base_component():
     """Komponent bazy wiedzy"""
     st.title("📚 Baza Wiedzy")
@@ -720,113 +894,7 @@ def knowledge_base_component():
                     st.rerun()
                 else:
                     st.error("Tytuł i zawartość są wymagane.")
-# === Komponent wyszukiwania i generowania komponentów ===
-def component_generator():
-    """Komponent do wyszukiwania i generowania komponentów Streamlit"""
-    st.subheader("🔍 Generator Komponentów")
-    
-    # Sprawdź inicjalizację serwisów
-    llm_service = st.session_state.get("llm_service")
-    db = st.session_state.get("db")
-    
-    if not llm_service or not db:
-        st.error("⚠️ Nie można zainicjalizować serwisów. Odśwież stronę i spróbuj ponownie.")
-        return
-    
-    # Interface
-    component_query = st.text_input(
-        "Opisz komponent, który chcesz wygenerować",
-        placeholder="Np. Interaktywny selektor plików z podglądem obrazów"
-    )
-    
-    # Opcje zaawansowane
-    with st.expander("Opcje zaawansowane", expanded=False):
-        include_comments = st.checkbox("Dodaj komentarze w kodzie", value=True)
-        use_examples = st.checkbox("Dodaj przykład użycia", value=True)
-        optimization_level = st.slider(
-            "Poziom optymalizacji",
-            min_value=1,
-            max_value=3,
-            value=2,
-            help="1: Podstawowy kod, 2: Zoptymalizowany, 3: Zaawansowana optymalizacja"
-        )
-    
-    # Przycisk generowania
-    if st.button("Generuj komponent") and component_query:
-        with st.spinner("Generowanie komponentu..."):
-            try:
-                # Przygotuj zapytanie
-                prompt = f"""
-                Wygeneruj komponent Streamlit według następującego opisu:
-                
-                {component_query}
-                
-                {"Dodaj komentarze wyjaśniające kod." if include_comments else ""}
-                {"Dodaj przykład użycia w praktyce." if use_examples else ""}
-                Poziom optymalizacji: {'Podstawowy' if optimization_level == 1 else 'Optymalny' if optimization_level == 2 else 'Zaawansowany'}
-                
-                Zwróć kompletny, gotowy do użycia fragment kodu, który można bezpośrednio wkleić do aplikacji Streamlit.
-                """
-                
-                # Wybierz model w zależności od złożoności zapytania
-                model = "anthropic/claude-3.7-sonnet"  # Domyślnie używamy najsilniejszego modelu dla kompleksowego kodu
-                
-                response = llm_service.call_llm(
-                    messages=[{"role": "user", "content": prompt}],
-                    model=model,
-                    system_prompt=DEFAULT_SYSTEM_PROMPT,
-                    temperature=0.2  # Niższa temperatura dla bardziej deterministycznego kodu
-                )
-                
-                # Obsługa i wyświetlanie wyników
-                result = response["choices"][0]["message"]["content"]
-                
-                # Aktualizuj statystyki tokenów
-                if "usage" in response:
-                    usage = response["usage"]
-                    st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
-                    st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
-                    cost = calculate_cost(model, usage["prompt_tokens"], usage["completion_tokens"])
-                    st.session_state["token_usage"]["cost"] += cost
-                
-                # Wyodrębnij kod z odpowiedzi (jeśli jest w bloku kodu)
-                code_pattern = r"```(?:python)?\n(.*?)```"
-                code_match = re.search(code_pattern, result, re.DOTALL)
-                
-                if code_match:
-                    generated_code = code_match.group(1)
-                else:
-                    generated_code = result
-                
-                # Wyświetl wynik
-                st.success("✅ Komponent wygenerowany!")
-                
-                st.code(generated_code, language="python")
-                
-                # Przycisk kopiowania
-                st.button(
-                    "📋 Kopiuj kod do schowka", 
-                    on_click=lambda: st.write("Kod skopiowany do schowka!")
-                )
-                
-                # Opcja zapisania do bazy wiedzy
-                st.write("---")
-                save_title = st.text_input("Tytuł dla bazy wiedzy", value=component_query[:50])
-                
-                if st.button("💾 Zapisz do bazy wiedzy"):
-                    if save_title:
-                        db.save_knowledge_item(
-                            save_title,
-                            f"### {save_title}\n\n```python\n{generated_code}\n```",
-                            "Komponenty UI",
-                            ["Kod", "Komponent", "Wygenerowany"]
-                        )
-                        st.success("✅ Zapisano w bazie wiedzy!")
-                    else:
-                        st.error("Podaj tytuł, aby zapisać komponent.")
-                
-            except Exception as e:
-                st.error(f"Wystąpił błąd podczas generowania komponentu: {str(e)}")
+
 # === Główna aplikacja ===
 def main():
     st.set_page_config(
@@ -840,23 +908,23 @@ def main():
     if "db" not in st.session_state:
         st.session_state["db"] = AssistantDB()
     
-    if "api_key" in st.session_state and "llm_service" not in st.session_state:
-        st.session_state["llm_service"] = LLMService(st.session_state["api_key"])
+    # Sprawdź autentykację
+    if not st.session_state.get("authenticated", False):
+        login_page()
+        return
+    
+    # Pobierz klucz API z secrets
+    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if api_key and "llm_service" not in st.session_state:
+        st.session_state["llm_service"] = LLMService(api_key)
+        st.session_state["api_key"] = api_key
     
     # Wyświetl sidebar
     page = sidebar_component()
     
     # Wyświetl główny komponent
     if page == "Chat Asystent":
-        # Podziel na zakładki dla głównego chata i generatora komponentów
-        chat_tab, generator_tab = st.tabs(["💬 Chat", "🧩 Generator Komponentów"])
-        
-        with chat_tab:
-            chat_component()
-        
-        with generator_tab:
-            component_generator()
-    
+        chat_component()
     elif page == "Baza Wiedzy":
         knowledge_base_component()
 
