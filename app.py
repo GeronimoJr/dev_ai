@@ -300,15 +300,13 @@ llm_service = LLMService()
 def process_code_blocks(text):
     """Przetwarza bloki kodu w tekście Markdown."""
     # Wzorzec do wykrywania bloków kodu
-    pattern = r'
-```(\w+)?\n(.*?)\n```'
+    pattern = r'```(\w+)?\n(.*?)\n```'
 
     # Funkcja do przetwarzania znalezionych bloków
     def process_match(match):
         language = match.group(1) or ''
         code = match.group(2)
-        return f'
-```{language}\n{code}\n```'
+        return f'```{language}\n{code}\n```'
 
     # Przetwarzanie tekstu z flagą re.DOTALL, aby dopasować wiele linii
     processed_text = re.sub(pattern, process_match, text, flags=re.DOTALL)
