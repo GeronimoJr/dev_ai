@@ -307,7 +307,7 @@ class LLMService:
                         "temperature": temperature,
                         "max_tokens": max_tokens
                     },
-                    timeout=120  # Zwiększenie timeout do 2 minut
+                    timeout=180  # Zwiększenie timeout do 3 minut
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -473,24 +473,39 @@ def sidebar_component():
 @requires_auth
 def chat_component():
     """Komponent interfejsu czatu"""
-    # Dodaj niestandardowy CSS dla przypiętego paska wejściowego
+    # Dodaj niestandardowy CSS dla przypiętego paska wejściowego i przycisków załączników
     st.markdown("""
     <style>
-    /* Miejsce na pasek wejściowy na dole */
+    /* Miejsce na pasek wejściowy i przyciski na dole */
     .main .block-container {
-        padding-bottom: 80px;
+        padding-bottom: 120px;
     }
     
     /* Przytwierdzony pasek wejściowy na dole ekranu */
     .stChatInputContainer {
         position: fixed;
-        bottom: 0;
+        bottom: 50px; /* Miejsce na przyciski załączników */
         left: 240px; /* Miejsce na sidebar */
         right: 0;
         padding: 1rem;
         background: white;
         z-index: 999;
         border-top: 1px solid #ddd;
+    }
+    
+    /* Przyciski załączników pod paskiem wejściowym */
+    .attachment-buttons {
+        position: fixed;
+        bottom: 0;
+        left: 240px;
+        right: 0;
+        padding: 0.5rem 1rem;
+        background: white;
+        z-index: 999;
+        display: flex;
+        justify-content: center;
+        gap: 10px;
+        border-top: 1px solid #f0f0f0;
     }
     
     /* Stylowanie załączników */
@@ -510,11 +525,47 @@ def chat_component():
     
     /* Na urządzeniach mobilnych */
     @media (max-width: 768px) {
-        .stChatInputContainer {
+        .stChatInputContainer, .attachment-buttons {
             left: 0;
         }
     }
+    
+    /* Przycisk załącznika */
+    .attachment-btn {
+        background: #f0f0f0;
+        border: none;
+        border-radius: 4px;
+        padding: 5px 10px;
+        font-size: 14px;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        margin: 0 5px;
+    }
+    
+    .attachment-btn:hover {
+        background: #e0e0e0;
+    }
     </style>
+    
+    <div class="attachment-buttons" id="attachment-buttons">
+        <button class="attachment-btn" onclick="toggleAttachment('image')">📷 Obraz</button>
+        <button class="attachment-btn" onclick="toggleAttachment('file')">📄 Plik</button>
+        <button class="attachment-btn" onclick="toggleAttachment('code')">💻 Kod</button>
+    </div>
+    
+    <script>
+    function toggleAttachment(type) {
+        // Automatycznie kliknij odpowiedni niewidoczny przycisk Streamlit
+        if (type === 'image') {
+            document.getElementById('btn_img').click();
+        } else if (type === 'file') {
+            document.getElementById('btn_file').click();
+        } else if (type === 'code') {
+            document.getElementById('btn_code').click();
+        }
+    }
+    </script>
     """, unsafe_allow_html=True)
     
     # Pobierz klucz API z secrets
@@ -588,21 +639,21 @@ def chat_component():
         ])
         st.markdown(f"<div style='margin-bottom: 5px'>{attachment_text}</div>", unsafe_allow_html=True)
     
-    # Obsługa załączników - tylko ikony pod polem czatu
+    # Ukryte przyciski do obsługi załączników (uruchamiane przez JavaScript)
     col1, col2, col3 = st.columns([1, 1, 1])
     
     with col1:
-        if st.button("📷 Obraz", use_container_width=True):
+        if st.button("Obraz", key="btn_img", help="Dodaj obraz"):
             st.session_state["show_image_uploader"] = not st.session_state.get("show_image_uploader", False)
             st.rerun()
     
     with col2:
-        if st.button("📄 Plik", use_container_width=True):
+        if st.button("Plik", key="btn_file", help="Dodaj plik"):
             st.session_state["show_file_uploader"] = not st.session_state.get("show_file_uploader", False)
             st.rerun()
     
     with col3:
-        if st.button("💻 Kod", use_container_width=True):
+        if st.button("Kod", key="btn_code", help="Dodaj kod"):
             st.session_state["show_code_input"] = not st.session_state.get("show_code_input", False)
             st.rerun()
     
@@ -758,7 +809,7 @@ def chat_component():
                         model=model,
                         system_prompt=system_prompt,
                         temperature=temperature,
-                        max_tokens=12000  # Zwiększone z 8000 do 12000 dla jeszcze dłuższych odpowiedzi
+                        max_tokens=12000
                     )
 
                     assistant_response = response["choices"][0]["message"]["content"]
