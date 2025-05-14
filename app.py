@@ -844,44 +844,43 @@ def chat_component():
         # Uzyskaj odpowiedź asystenta
         with st.spinner("Generowanie odpowiedzi..."):
             try:
-    model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
-    system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
-    temperature = st.session_state.get("temperature", 0.7)
+                model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
+                system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
+                temperature = st.session_state.get("temperature", 0.7)
 
-    response = llm_service.call_llm(
-        messages=api_messages,
-        model=model,
-        system_prompt=system_prompt,
-        temperature=temperature
-    )
+                response = llm_service.call_llm(
+                    messages=api_messages,
+                    model=model,
+                    system_prompt=system_prompt,
+                    temperature=temperature
+                )
 
-    assistant_response = response["choices"][0]["message"]["content"]
+                assistant_response = response["choices"][0]["message"]["content"]
 
-    # Aktualizuj statystyki tokenów
-    if "usage" in response:
-        usage = response["usage"]
-        st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
-        st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+                # Aktualizuj statystyki tokenów
+                if "usage" in response:
+                    usage = response["usage"]
+                    st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
+                    st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
 
-        # Oblicz koszt
-        cost = calculate_cost(
-            model, 
-            usage["prompt_tokens"], 
-            usage["completion_tokens"]
-        )
+                    # Oblicz koszt
+                    cost = calculate_cost(
+                        model, 
+                        usage["prompt_tokens"], 
+                        usage["completion_tokens"]
+                    )
 
-        st.session_state["token_usage"]["cost"] += cost
+                    st.session_state["token_usage"]["cost"] += cost
 
-    # Zapisz odpowiedź asystenta
-    db.save_message(current_conversation_id, "assistant", assistant_response)
+                # Zapisz odpowiedź asystenta
+                db.save_message(current_conversation_id, "assistant", assistant_response)
 
-    # Wyczyść załączniki po wysłaniu
-    st.session_state["attachments"] = []
-    
-except Exception as e:
-    st.error(f"Wystąpił błąd: {str(e)}")
-    st.error("Szczegóły: " + str(type(e)))
-
+                # Wyczyść załączniki po wysłaniu
+                st.session_state["attachments"] = []
+                
+            except Exception as e:
+                st.error(f"Wystąpił błąd: {str(e)}")
+                st.error("Szczegóły: " + str(type(e)))
 
 @requires_auth
 def knowledge_base_component():
