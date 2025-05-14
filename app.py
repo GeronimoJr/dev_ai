@@ -24,31 +24,31 @@ KNOWLEDGE_CATEGORIES = [
 
 MODEL_OPTIONS = [
     {
-        "id": "anthropic/claude-3.7-sonnet",
+        "id": "anthropic/claude-3.7-sonnet:floor",
         "name": "Claude 3.7 Sonnet",
         "pricing": {"prompt": 3.0, "completion": 15.0},
         "description": "Zalecany - Najnowszy model Claude z doskonałymi umiejętnościami kodowania"
     },
     {
-        "id": "anthropic/claude-3.7-haiku-thinking",
+        "id": "anthropic/claude-3.7-sonnet:thinking",
         "name": "Claude 3.7 Thinking",
         "pricing": {"prompt": 3.0, "completion": 15.0},
         "description": "Model Claude wykorzystujący dodatkowy czas na analizę problemów"
     },
     {
-        "id": "openai/gpt-4o",
+        "id": "openai/gpt-4o:floor",
         "name": "GPT-4o",
         "pricing": {"prompt": 2.5, "completion": 10.0},
         "description": "Silna alternatywa z dobrymi zdolnościami kodowania"
     },
     {
-        "id": "openai/gpt-4-turbo",
+        "id": "openai/gpt-4-turbo:floor",
         "name": "GPT-4 Turbo",
         "pricing": {"prompt": 2.5, "completion": 10.0},
         "description": "Nieco starszy model GPT-4 Turbo"
     },
     {
-        "id": "anthropic/claude-3.5-haiku",
+        "id": "anthropic/claude-3.5-haiku:floor",
         "name": "Claude 3.5 Haiku",
         "pricing": {"prompt": 0.8, "completion": 4.0},
         "description": "Szybszy, tańszy model do prostszych zadań"
@@ -73,7 +73,6 @@ Gdy podajesz przykłady kodu, przestrzegaj tych zasad:
 
 Zawsze dziel aplikacje na logiczne komponenty i funkcje, zamiast pisać wszystko w jednym bloku kodu.
 Pamiętaj o zarządzaniu stanem sesji w Streamlit i optymalizacji kosztów przy korzystaniu z API modeli językowych.
-:floordevai.txt:
 """
 
 # === Funkcja dekoratora dla autoryzacji ===
