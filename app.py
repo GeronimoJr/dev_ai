@@ -759,8 +759,7 @@ def chat_component():
                 st.session_state["attachments"].append({
                     "type": "file",
                     "name": file_name,
-                    "text_content": f"
-```{code_language}\n{code_content}\n```"
+                    "text_content": f"```{code_language}\n{code_content}\n```"
                 })
                 st.success(f"Dodano kod: {file_name}")
                 st.rerun()
