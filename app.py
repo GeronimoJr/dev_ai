@@ -1,730 +1,882 @@
 import streamlit as st
-import sqlite3
-import datetime
+import requests
+import json
 import os
+import re
 import time
+import uuid
+import sqlite3
+from datetime import datetime
+import tiktoken
+from typing import List, Dict, Any, Optional
+import hashlib
+from functools import wraps
 import base64
 import io
-import json
-import random
-import string
-import requests
-from PIL import Image
-import openai
-import hashlib
-import re
-from typing import List, Dict, Any, Optional, Tuple, Union
-import logging
 
-# Konfiguracja logowania
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# === Konfiguracja ===
+MODEL_OPTIONS = [
+    {
+        "id": "anthropic/claude-3.7-sonnet:floor",
+        "name": "Claude 3.7 Sonnet",
+        "pricing": {"prompt": 3.0, "completion": 15.0},
+        "description": "Zalecany - Najnowszy model Claude z doskonałymi umiejętnościami kodowania"
+    },
+    {
+        "id": "anthropic/claude-3.7-sonnet:thinking",
+        "name": "Claude 3.7 Thinking",
+        "pricing": {"prompt": 3.0, "completion": 15.0},
+        "description": "Model Claude wykorzystujący dodatkowy czas na analizę problemów"
+    },
+    {
+        "id": "openai/gpt-4o:floor",
+        "name": "GPT-4o",
+        "pricing": {"prompt": 2.5, "completion": 10.0},
+        "description": "Silna alternatywa z dobrymi zdolnościami kodowania"
+    },
+    {
+        "id": "openai/gpt-4-turbo:floor",
+        "name": "GPT-4 Turbo",
+        "pricing": {"prompt": 2.5, "completion": 10.0},
+        "description": "Nieco starszy model GPT-4 Turbo"
+    },
+    {
+        "id": "anthropic/claude-3.5-haiku:floor",
+        "name": "Claude 3.5 Haiku",
+        "pricing": {"prompt": 0.8, "completion": 4.0},
+        "description": "Szybszy, tańszy model do prostszych zadań"
+    }
+]
 
-# Konfiguracja strony Streamlit
-st.set_page_config(
-    page_title="FloorDev AI Assistant",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+DEFAULT_SYSTEM_PROMPT = """Jesteś ekspertkim asystentem specjalizującym się w tworzeniu aplikacji Streamlit wykorzystujących AI. 
+Pomagasz projektować, kodować i optymalizować aplikacje Streamlit, szczególnie te korzystające z modeli językowych i innych usług AI.
 
-# Klasa do obsługi bazy danych
+Twoja wiedza specjalistyczna obejmuje:
+1. Pisanie czystego, efektywnego kodu Streamlit
+2. Projektowanie skutecznych interfejsów użytkownika wykorzystujących AI
+3. Integrację z API jak OpenRouter, OpenAI, Anthropic, itp.
+4. Optymalizację wydajności i kosztów przy korzystaniu z usług AI
+5. Wdrażanie najlepszych praktyk dla aplikacji Streamlit
+
+Gdy podajesz przykłady kodu, przestrzegaj tych zasad:
+- Dołączaj kompletne, działające rozwiązania, które można skopiować i użyć bezpośrednio
+- Dodawaj krótkie komentarze wyjaśniające złożone części
+- Formatuj kod z odpowiednim wcięciem i strukturą
+- Skup się na najlepszych praktykach i efektywnych wzorcach Streamlit
+
+Zawsze dziel aplikacje na logiczne komponenty i funkcje, zamiast pisać wszystko w jednym bloku kodu.
+Pamiętaj o zarządzaniu stanem sesji w Streamlit i optymalizacji kosztów przy korzystaniu z API modeli językowych.
+:floordevai.txt:
+"""
+
+# === Funkcja dekoratora dla autoryzacji ===
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not st.session_state.get("authenticated", False):
+            return login_page()
+        return f(*args, **kwargs)
+    return decorated
+
+def login_page():
+    """Strona logowania"""
+    st.title("🔒 Logowanie")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("### Zaloguj się, aby uzyskać dostęp")
+        
+        username = st.text_input("Nazwa użytkownika", key="login_username")
+        password = st.text_input("Hasło", type="password", key="login_password")
+        
+        if st.button("Zaloguj"):
+            # Pobierz ustawienia z secrets
+            correct_username = st.secrets.get("APP_USER", "admin")
+            correct_password = st.secrets.get("APP_PASSWORD", "password")
+            
+            if username == correct_username and password == correct_password:
+                st.session_state["authenticated"] = True
+                st.success("Zalogowano pomyślnie!")
+                st.rerun()
+            else:
+                st.error("Nieprawidłowa nazwa użytkownika lub hasło!")
+
+# === Zarządzanie bazą danych ===
 class AssistantDB:
-    def __init__(self, db_path="assistant_data.db"):
-        """Inicjalizuje połączenie z bazą danych."""
-        self.db_path = db_path
-        self.init_db()
-
-    def get_connection(self):
-        """Tworzy i zwraca połączenie z bazą danych."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def init_db(self):
-        """Inicjalizuje bazę danych, tworząc tabele jeśli nie istnieją."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        # Tworzenie tabeli użytkowników
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-
-        # Tworzenie tabeli konwersacji
+    def __init__(self, db_path='streamlit_assistant.db'):
+        """Inicjalizacja połączenia z bazą danych i tabel"""
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._create_tables()
+    
+    def _create_tables(self):
+        """Utwórz tabele bazy danych, jeśli nie istnieją"""
+        cursor = self.conn.cursor()
+        
+        # Tabela konwersacji
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id TEXT PRIMARY KEY,
             title TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
         )
         ''')
-
-        # Tworzenie tabeli wiadomości
+        
+        # Tabela wiadomości
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id INTEGER,
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT,
             role TEXT,
             content TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            timestamp TIMESTAMP,
             attachments TEXT,
             FOREIGN KEY (conversation_id) REFERENCES conversations (id)
         )
         ''')
+        
+        self.conn.commit()
 
-        conn.commit()
-        conn.close()
+    def save_message(self, conversation_id: str, role: str, content: str, attachments=None) -> str:
+        """Zapisz wiadomość w bazie danych"""
+        cursor = self.conn.cursor()
+        message_id = str(uuid.uuid4())
+        
+        # Przygotuj załączniki do zapisu (konwersja danych binarnych)
+        serializable_attachments = []
+        if attachments:
+            for attachment in attachments:
+                # Tworzymy nowy słownik zawierający tylko serializowalne dane
+                serialized = {
+                    "type": attachment.get("type", ""),
+                    "name": attachment.get("name", "")
+                }
+                
+                # Jeśli jest text_content, dodajemy go
+                if "text_content" in attachment:
+                    serialized["text_content"] = attachment["text_content"]
+                
+                # Nie zapisujemy binarnych danych w bazie danych
+                serializable_attachments.append(serialized)
+        
+        attachments_json = json.dumps(serializable_attachments)
+        
+        cursor.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, timestamp, attachments) VALUES (?, ?, ?, ?, ?, ?)",
+            (message_id, conversation_id, role, content, datetime.now(), attachments_json)
+        )
+        self.conn.commit()
+        return message_id
+    
+    def get_messages(self, conversation_id: str) -> List[Dict[str, Any]]:
+        """Pobierz wszystkie wiadomości dla konwersacji"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT role, content, attachments FROM messages WHERE conversation_id = ? ORDER BY timestamp",
+            (conversation_id,)
+        )
+        
+        messages = []
+        for role, content, attachments_json in cursor.fetchall():
+            try:
+                attachments = json.loads(attachments_json) if attachments_json else []
+                
+                messages.append({
+                    "role": role,
+                    "content": content,
+                    "attachments": attachments
+                })
+            except Exception as e:
+                # W przypadku błędu, dodaj wiadomość bez załączników
+                messages.append({
+                    "role": role,
+                    "content": content,
+                    "attachments": []
+                })
+                
+        return messages
 
-    def create_user(self, username, password):
-        """Tworzy nowego użytkownika w bazie danych."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        # Haszowanie hasła
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-
-        try:
+    def save_conversation(self, conversation_id: str, title: str):
+        """Utwórz lub zaktualizuj konwersację"""
+        cursor = self.conn.cursor()
+        now = datetime.now()
+        
+        # Sprawdź, czy konwersacja istnieje
+        cursor.execute("SELECT id FROM conversations WHERE id = ?", (conversation_id,))
+        if cursor.fetchone():
+            # Aktualizuj istniejącą konwersację
             cursor.execute(
-                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                (username, password_hash)
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                (title, now, conversation_id)
             )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            # Użytkownik już istnieje
-            return False
-        finally:
-            conn.close()
-
-    def verify_user(self, username, password):
-        """Weryfikuje dane logowania użytkownika."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        # Haszowanie hasła
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-
-        cursor.execute(
-            "SELECT id FROM users WHERE username = ? AND password_hash = ?",
-            (username, password_hash)
-        )
-        user = cursor.fetchone()
-        conn.close()
-
-        return user['id'] if user else None
-
-    def get_user_id(self, username):
-        """Pobiera ID użytkownika na podstawie nazwy użytkownika."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
-        user = cursor.fetchone()
-        conn.close()
-
-        return user['id'] if user else None
-
-    def create_conversation(self, user_id, title=None):
-        """Tworzy nową konwersację dla użytkownika."""
-        if not title:
-            title = f"Nowa konwersacja {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "INSERT INTO conversations (user_id, title) VALUES (?, ?)",
-            (user_id, title)
-        )
-        conversation_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-
-        return conversation_id
-
-    def update_conversation_title(self, conversation_id, new_title):
-        """Aktualizuje tytuł konwersacji."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "UPDATE conversations SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (new_title, conversation_id)
-        )
-        conn.commit()
-        conn.close()
-
-    def get_conversations(self, user_id):
-        """Pobiera wszystkie konwersacje użytkownika."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT id, title, created_at FROM conversations WHERE user_id = ? ORDER BY updated_at DESC",
-            (user_id,)
-        )
-        conversations = cursor.fetchall()
-        conn.close()
-
-        return [dict(conv) for conv in conversations]
-
-    def delete_conversation(self, conversation_id):
-        """Usuwa konwersację i jej wiadomości."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        # Najpierw usuwamy wiadomości
-        cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-
-        # Następnie usuwamy konwersację
-        cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-
-        conn.commit()
-        conn.close()
-
-    def add_message(self, conversation_id, role, content, attachments=None):
-        """Dodaje nową wiadomość do konwersacji."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        attachments_json = json.dumps(attachments) if attachments else None
-
-        cursor.execute(
-            "INSERT INTO messages (conversation_id, role, content, attachments) VALUES (?, ?, ?, ?)",
-            (conversation_id, role, content, attachments_json)
-        )
-
-        # Aktualizacja czasu ostatniej modyfikacji konwersacji
-        cursor.execute(
-            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (conversation_id,)
-        )
-
-        conn.commit()
-        conn.close()
-
-    def get_messages(self, conversation_id):
-        """Pobiera wszystkie wiadomości z konwersacji."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT id, role, content, timestamp, attachments FROM messages WHERE conversation_id = ? ORDER BY timestamp",
-            (conversation_id,)
-        )
-        messages = cursor.fetchall()
-        conn.close()
-
-        result = []
-        for msg in messages:
-            message_dict = dict(msg)
-            if message_dict['attachments']:
-                message_dict['attachments'] = json.loads(message_dict['attachments'])
-            else:
-                message_dict['attachments'] = None
-            result.append(message_dict)
-
-        return result
-
-# Klasa do obsługi modelu językowego
-class LLMService:
-    def __init__(self, api_key=None, model="gpt-4-turbo"):
-        """Inicjalizuje usługę modelu językowego."""
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.model = model
-
-        # Ustawienie klucza API
-        if self.api_key:
-            openai.api_key = self.api_key
         else:
-            logging.warning("Brak klucza API dla modelu językowego!")
+            # Utwórz nową konwersację
+            cursor.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (conversation_id, title, now, now)
+            )
+        
+        self.conn.commit()
+    
+    def get_conversations(self) -> List[Dict[str, Any]]:
+        """Pobierz wszystkie konwersacje"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id, title, created_at FROM conversations ORDER BY updated_at DESC"
+        )
+        return [
+            {"id": conv_id, "title": title, "created_at": created_at} 
+            for conv_id, title, created_at in cursor.fetchall()
+        ]
 
-    def generate_response(self, messages, max_retries=3, retry_delay=2):
-        """Generuje odpowiedź modelu językowego z obsługą ponownych prób."""
-        if not self.api_key:
-            return "Brak klucza API dla modelu językowego. Skonfiguruj klucz w ustawieniach."
+    def delete_conversation(self, conversation_id: str):
+        """Usuń konwersację i jej wiadomości"""
+        cursor = self.conn.cursor()
+        # Najpierw usuń wiadomości (ograniczenie klucza obcego)
+        cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        # Usuń konwersację
+        cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        self.conn.commit()
 
-        # Przygotowanie wiadomości dla API
-        formatted_messages = []
+# === Serwis LLM ===
+class LLMService:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        
+        # Prosta pamięć podręczna dla powtarzających się pytań
+        self.cache = {}
+
+    def count_tokens(self, text: str) -> int:
+        """Oszacuj liczbę tokenów dla Claude"""
+        try:
+            encoding = tiktoken.encoding_for_model("gpt-4")  # Używamy kodowania gpt-4 jako przybliżenia
+            return len(encoding.encode(text))
+        except:
+            # Fallback do cl100k_base, jeśli określone kodowanie nie jest dostępne
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+
+    def get_cache_key(self, messages, model, system_prompt, temperature):
+        """Generuj klucz pamięci podręcznej dla zapytania LLM"""
+        cache_input = f"{json.dumps(messages)}-{model}-{system_prompt}-{temperature}"
+        return hashlib.md5(cache_input.encode()).hexdigest()
+
+    def call_llm(self, 
+                messages: List[Dict[str, str]], 
+                model: str = "anthropic/claude-3.7-sonnet:floor", 
+                system_prompt: str = None, 
+                temperature: float = 0.7, 
+                max_tokens: int = 12000,  # Zwiększenie max_tokens dla jeszcze dłuższych odpowiedzi
+                use_cache: bool = True) -> Dict[str, Any]:
+        """Wywołaj API LLM przez OpenRouter z opcjonalnym cachowaniem"""
+        # Sprawdź pamięć podręczną, jeśli używamy cachowania
+        if use_cache and temperature < 0.1:  # Cachujemy tylko deterministyczne odpowiedzi
+            cache_key = self.get_cache_key(messages, model, system_prompt, temperature)
+            if cache_key in self.cache:
+                return self.cache[cache_key]
+        
+        # Przygotuj wiadomości z promptem systemowym, jeśli podano
+        api_messages = []
+        if system_prompt:
+            api_messages.append({"role": "system", "content": system_prompt})
+        api_messages.extend(messages)
+        
+        # Oblicz tokeny promptu
+        prompt_text = system_prompt or ""
         for msg in messages:
-            message = {"role": msg["role"], "content": []}
-
-            # Dodanie głównej treści jako tekstu
-            message["content"].append({"type": "text", "text": msg["content"]})
-
-            # Dodanie załączników, jeśli istnieją
-            if msg.get("attachments"):
-                for attachment in msg["attachments"]:
-                    if attachment["type"] == "image":
-                        # Dodanie obrazu jako załącznika
-                        message["content"].append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": attachment["data"],
-                                "detail": "high"
-                            }
-                        })
-
-            formatted_messages.append(message)
-
+            prompt_text += msg["content"]
+        prompt_tokens = self.count_tokens(prompt_text)
+        
+        # Zdefiniuj parametry ponawiania
+        max_retries = 3
+        retry_delay = 2  # sekundy
+        
+        # Próba wywołania API z ponawianiem
         for attempt in range(max_retries):
             try:
-                response = openai.chat.completions.create(
-                    model=self.model,
-                    messages=formatted_messages,
-                    temperature=0.7,
-                    max_tokens=4000
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": model,
+                        "messages": api_messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens
+                    },
+                    timeout=180  # Zwiększenie timeout do 3 minut
                 )
-                return response.choices[0].message.content
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logging.warning(f"Próba {attempt+1} nie powiodła się: {str(e)}. Ponowna próba za {retry_delay} s...")
-                    time.sleep(retry_delay)
-                else:
-                    logging.error(f"Wszystkie próby nie powiodły się: {str(e)}")
-                    return f"Wystąpił błąd podczas komunikacji z modelem: {str(e)}"
+                response.raise_for_status()
+                result = response.json()
+                
+                # Oszacuj tokeny odpowiedzi
+                response_content = result["choices"][0]["message"]["content"]
+                completion_tokens = self.count_tokens(response_content)
+                
+                # Dodaj informacje o tokenach i tworzenach do wyniku
+                result["usage"] = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
+                
+                # Dodaj do pamięci podręcznej, jeśli używamy cachowania
+                if use_cache and temperature < 0.1:
+                    cache_key = self.get_cache_key(messages, model, system_prompt, temperature)
+                    self.cache[cache_key] = result
+                
+                return result
+            
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:  # Ostatnia próba
+                    raise Exception(f"Nie udało się połączyć z API po {max_retries} próbach: {str(e)}")
+                
+                # Czekaj przed ponowieniem
+                time.sleep(retry_delay * (2 ** attempt))  # Wykładnicze wycofanie
 
-# Inicjalizacja bazy danych i usługi LLM
-db = AssistantDB()
-llm_service = LLMService()
+# === Funkcje pomocnicze ===
+def calculate_cost(model_id: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Oblicz szacowany koszt zapytania w USD"""
+    for model in MODEL_OPTIONS:
+        if model["id"] == model_id:
+            return (prompt_tokens / 1_000_000) * model["pricing"]["prompt"] + \
+                   (completion_tokens / 1_000_000) * model["pricing"]["completion"]
+    return 0.0  # W przypadku nieznalezienia modelu
 
-# Funkcje pomocnicze
-def process_code_blocks(text):
-    """Przetwarza bloki kodu w tekście Markdown."""
-    # Wzorzec do wykrywania bloków kodu
-    pattern = r'```(\w+)?\n(.*?)\n```'
-
-    # Funkcja do przetwarzania znalezionych bloków
-    def process_match(match):
-        language = match.group(1) or ''
+def format_message_for_display(message: Dict[str, str]) -> str:
+    """Formatuj wiadomość do wyświetlenia w interfejsie, ze wsparciem dla bloków kodu"""
+    content = message.get("content", "")
+    
+    # Wyodrębnianie i formatowanie bloków kodu
+    def replace_code_block(match):
+        lang = match.group(1) or ""
         code = match.group(2)
-        return f'```{language}\n{code}\n```'
+        return f"```{lang}\n{code}\n```"
+    
+    # Zastąp bloki kodu ze składnią markdown
+    content = re.sub(r"```(.*?)\n(.*?)```", replace_code_block, content, flags=re.DOTALL)
+    
+    return content
 
-    # Przetwarzanie tekstu z flagą re.DOTALL, aby dopasować wiele linii
-    processed_text = re.sub(pattern, process_match, text, flags=re.DOTALL)
-    return processed_text
+def get_conversation_title(messages: List[Dict[str, str]], llm_service: LLMService, api_key: str) -> str:
+    """Wygeneruj tytuł dla nowej konwersacji na podstawie pierwszej wiadomości użytkownika"""
+    if not messages:
+        return f"Nowa konwersacja {datetime.now().strftime('%d-%m-%Y %H:%M')}"
+    
+    # Użyj pierwszej wiadomości użytkownika jako podstawy tytułu
+    user_message = next((m["content"] for m in messages if m["role"] == "user"), "")
+    
+    if len(user_message) > 40:
+        # Skorzystaj z LLM, aby stworzyć krótki, opisowy tytuł
+        try:
+            response = llm_service.call_llm(
+                messages=[
+                    {"role": "user", "content": f"Utwórz krótki, opisowy tytuł (max. 5 słów) dla następującej konwersacji, bez cudzysłowów: {user_message[:200]}..."}
+                ],
+                model="anthropic/claude-3.5-haiku:floor",  # Tańszy model jest wystarczający do tworzenia tytułów
+                system_prompt="Jesteś pomocnym asystentem, który tworzy krótkie, opisowe tytuły konwersacji.",
+                temperature=0.2,
+                max_tokens=20,
+                use_cache=True
+            )
+            title = response["choices"][0]["message"]["content"].strip().strip('"\'')
+            # Usuń znaki, które mogłyby sprawiać problemy z interfejsem
+            title = re.sub(r'[^\w\s\-.,]', '', title)
+            return title[:40]
+        except Exception:
+            # W przypadku błędu, wróć do domyślnego tytułu
+            pass
+    
+    # Domyślnie użyj skróconej wiadomości użytkownika
+    return user_message[:40] + ("..." if len(user_message) > 40 else "")
 
-def encode_image(image_file):
-    """Koduje obraz do formatu base64 dla API."""
-    return f"data:image/jpeg;base64,{base64.b64encode(image_file.getvalue()).decode('utf-8')}"
+# === Komponenty interfejsu użytkownika ===
+def sidebar_component():
+    """Komponent paska bocznego z konwersacjami i ustawieniami"""
+    st.sidebar.title("AI Asystent Developera")
+    
+    # Ustawienia modelu
+    with st.sidebar.expander("⚙️ Ustawienia modelu", expanded=False):
+        model_options = {model["id"]: f"{model['name']}" for model in MODEL_OPTIONS}
+        selected_model = st.selectbox(
+            "Model LLM",
+            options=list(model_options.keys()),
+            format_func=lambda x: model_options[x],
+            index=0,
+            key="model_selection"
+        )
+        
+        # Pokaż opis modelu
+        for model in MODEL_OPTIONS:
+            if model["id"] == selected_model:
+                st.info(model["description"])
+        
+        temperature = st.slider(
+            "Temperatura",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.get("temperature", 0.7),
+            step=0.1,
+            help="Wyższa wartość = bardziej kreatywne odpowiedzi"
+        )
+        
+        st.session_state["temperature"] = temperature
+        
+        custom_system_prompt = st.text_area(
+            "Prompt systemowy (opcjonalnie)",
+            value=st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT),
+            help="Dostosuj zachowanie asystenta"
+        )
+        
+        if st.button("Zresetuj do domyślnego"):
+            custom_system_prompt = DEFAULT_SYSTEM_PROMPT
+        
+        st.session_state["custom_system_prompt"] = custom_system_prompt
+    
+    # Statystyki tokenów
+    if "token_usage" in st.session_state:
+        with st.sidebar.expander("📊 Statystyki tokenów", expanded=False):
+            st.metric("Tokeny prompt", st.session_state["token_usage"]["prompt"])
+            st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
+            st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
+    
+    # Lista konwersacji
+    db = st.session_state.get("db")
+    if db:
+        with st.sidebar.expander("💬 Konwersacje", expanded=True):
+            conversations = db.get_conversations()
+            
+            if conversations:
+                for conv in conversations:
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        if st.button(conv["title"], key=f"conv_{conv['id']}", use_container_width=True):
+                            st.session_state["current_conversation_id"] = conv["id"]
+                            st.rerun()
+                    with col2:
+                        if st.button("🗑️", key=f"del_{conv['id']}", help="Usuń konwersację"):
+                            db.delete_conversation(conv["id"])
+                            if st.session_state.get("current_conversation_id") == conv["id"]:
+                                st.session_state["current_conversation_id"] = None
+                            st.rerun()
+            else:
+                st.write("Brak zapisanych konwersacji")
+        
+        # Przycisk nowej konwersacji
+        if st.sidebar.button("➕ Nowa konwersacja", use_container_width=True):
+            st.session_state["current_conversation_id"] = str(uuid.uuid4())
+            st.rerun()
 
-def read_text_file(file):
-    """Odczytuje zawartość pliku tekstowego."""
-    try:
-        content = file.getvalue().decode('utf-8')
-        return content
-    except UnicodeDecodeError:
-        return "Nie można odczytać pliku - to nie jest plik tekstowy."
-
-# Inicjalizacja stanu sesji
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-
-if "user_id" not in st.session_state:
-    st.session_state["user_id"] = None
-
-if "username" not in st.session_state:
-    st.session_state["username"] = None
-
-if "current_conversation_id" not in st.session_state:
-    st.session_state["current_conversation_id"] = None
-
-if "show_image_uploader" not in st.session_state:
-    st.session_state["show_image_uploader"] = False
-
-if "show_file_uploader" not in st.session_state:
-    st.session_state["show_file_uploader"] = False
-
-if "show_code_input" not in st.session_state:
-    st.session_state["show_code_input"] = False
-
-# Dodaj niestandardowy CSS dla przypiętego paska wejściowego i przycisku załącznika
-st.markdown("""
-<style>
-/* Miejsce na pasek wejściowy na dole */
-.main .block-container {
-    padding-bottom: 80px;
-}
-
-/* Przytwierdzony pasek wejściowy na dole ekranu */
-.stChatInputContainer {
-    position: fixed;
-    bottom: 0;
-    left: 240px; /* Miejsce na sidebar */
-    right: 0;
-    padding: 1rem;
-    background: white;
-    z-index: 999;
-    border-top: 1px solid #ddd;
-    display: flex;
-    align-items: center;
-}
-
-/* Stylowanie przycisku załącznika */
-.attachment-button {
-    margin-left: 10px;
-    background-color: #f0f2f6;
-    border-radius: 50%;
-    width: 36px;
-    height: 36px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    border: 1px solid #ddd;
-}
-
-.attachment-button:hover {
-    background-color: #e0e2e6;
-}
-
-/* Stylowanie załączników */
-.attachment-badge {
-    display: inline-block;
-    padding: 2px 8px;
-    margin: 2px;
-    background-color: #f0f2f6;
-    border-radius: 10px;
-    font-size: 0.8em;
-}
-
-/* Style dla bloków kodu */
-.stMarkdown pre {
-    overflow-x: auto;
-}
-
-/* Na urządzeniach mobilnych */
-@media (max-width: 768px) {
+@requires_auth
+def chat_component():
+    """Komponent interfejsu czatu"""
+    # Dodaj niestandardowy CSS dla przypiętego paska wejściowego i przycisków załączników
+    st.markdown("""
+    <style>
+    /* Miejsce na pasek wejściowy i przyciski na dole */
+    .main .block-container {
+        padding-bottom: 120px;
+    }
+    
+    /* Przytwierdzony pasek wejściowy na dole ekranu */
     .stChatInputContainer {
-        left: 0;
+        position: fixed;
+        bottom: 50px; /* Miejsce na przyciski załączników */
+        left: 240px; /* Miejsce na sidebar */
+        right: 0;
+        padding: 1rem;
+        background: white;
+        z-index: 999;
+        border-top: 1px solid #ddd;
     }
-}
-</style>
-
-<script>
-// Dodajemy przycisk załącznika obok pola wejściowego
-document.addEventListener('DOMContentLoaded', function() {
-    const chatInputContainer = document.querySelector('.stChatInputContainer');
-    if (chatInputContainer) {
-        const attachButton = document.createElement('div');
-        attachButton.className = 'attachment-button';
-        attachButton.innerHTML = '📎';
-        attachButton.title = 'Dodaj załącznik';
-        attachButton.onclick = function() {
-            // Wywołanie funkcji Streamlit poprzez kliknięcie ukrytego przycisku
-            document.getElementById('attach_button_trigger').click();
-        };
-        chatInputContainer.appendChild(attachButton);
+    
+    /* Przyciski załączników pod paskiem wejściowym */
+    .attachment-buttons {
+        position: fixed;
+        bottom: 0;
+        left: 240px;
+        right: 0;
+        padding: 0.5rem 1rem;
+        background: white;
+        z-index: 999;
+        display: flex;
+        justify-content: center;
+        gap: 10px;
+        border-top: 1px solid #f0f0f0;
     }
-});
-</script>
-""", unsafe_allow_html=True)
+    
+    /* Stylowanie załączników */
+    .attachment-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        margin: 2px;
+        background-color: #f0f2f6;
+        border-radius: 10px;
+        font-size: 0.8em;
+    }
+    
+    /* Style dla bloków kodu */
+    .stMarkdown pre {
+        overflow-x: auto;
+    }
+    
+    /* Na urządzeniach mobilnych */
+    @media (max-width: 768px) {
+        .stChatInputContainer, .attachment-buttons {
+            left: 0;
+        }
+    }
+    
+    /* Przycisk załącznika */
+    .attachment-btn {
+        background: #f0f0f0;
+        border: none;
+        border-radius: 4px;
+        padding: 5px 10px;
+        font-size: 14px;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        margin: 0 5px;
+    }
+    
+    .attachment-btn:hover {
+        background: #e0e0e0;
+    }
+    </style>
+    
+    <div class="attachment-buttons" id="attachment-buttons">
+        <button class="attachment-btn" onclick="toggleAttachment('image')">📷 Obraz</button>
+        <button class="attachment-btn" onclick="toggleAttachment('file')">📄 Plik</button>
+        <button class="attachment-btn" onclick="toggleAttachment('code')">💻 Kod</button>
+    </div>
+    
+    <script>
+    function toggleAttachment(type) {
+        // Automatycznie kliknij odpowiedni niewidoczny przycisk Streamlit
+        if (type === 'image') {
+            document.getElementById('btn_img').click();
+        } else if (type === 'file') {
+            document.getElementById('btn_file').click();
+        } else if (type === 'code') {
+            document.getElementById('btn_code').click();
+        }
+    }
+    </script>
+    """, unsafe_allow_html=True)
+    
+    # Pobierz klucz API z secrets
+    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        st.warning("⚠️ Brak klucza API OpenRouter w ustawieniach secrets.")
+        return
 
-# Funkcja do logowania
-def login_page():
-    st.title("FloorDev AI Assistant")
+    # Aktualizuj klucz API w sesji
+    st.session_state["api_key"] = api_key
 
-    tab1, tab2 = st.tabs(["Logowanie", "Rejestracja"])
+    # Pobierz instancję serwisu LLM i bazy danych
+    if "llm_service" not in st.session_state or st.session_state.get("llm_service") is None:
+        st.session_state["llm_service"] = LLMService(api_key)
 
-    with tab1:
-        username = st.text_input("Nazwa użytkownika", key="login_username")
-        password = st.text_input("Hasło", type="password", key="login_password")
+    llm_service = st.session_state.get("llm_service")
+    db = st.session_state.get("db")
 
-        if st.button("Zaloguj się", key="login_button"):
-            user_id = db.verify_user(username, password)
-            if user_id:
-                st.session_state["logged_in"] = True
-                st.session_state["user_id"] = user_id
-                st.session_state["username"] = username
-                st.rerun()
-            else:
-                st.error("Nieprawidłowa nazwa użytkownika lub hasło.")
+    if not llm_service or not db:
+        st.error("⚠️ Nie można zainicjalizować serwisów. Odśwież stronę i spróbuj ponownie.")
+        return
 
-    with tab2:
-        new_username = st.text_input("Nazwa użytkownika", key="register_username")
-        new_password = st.text_input("Hasło", type="password", key="register_password")
-        confirm_password = st.text_input("Potwierdź hasło", type="password", key="confirm_password")
+    # Inicjalizacja zmiennych sesji dla konwersacji
+    if "current_conversation_id" not in st.session_state:
+        st.session_state["current_conversation_id"] = str(uuid.uuid4())
 
-        if st.button("Zarejestruj się", key="register_button"):
-            if new_password != confirm_password:
-                st.error("Hasła nie są zgodne.")
-            elif len(new_password) < 4:
-                st.error("Hasło musi mieć co najmniej 4 znaki.")
-            else:
-                success = db.create_user(new_username, new_password)
-                if success:
-                    st.success("Rejestracja udana. Możesz się teraz zalogować.")
-                else:
-                    st.error("Nazwa użytkownika jest już zajęta.")
+    current_conversation_id = st.session_state["current_conversation_id"]
 
-# Funkcja do wyświetlania konwersacji
-def main_page():
-    # Sidebar z listą konwersacji
-    with st.sidebar:
-        st.title(f"Witaj, {st.session_state['username']}!")
+    # Statystyki konwersacji
+    if "token_usage" not in st.session_state:
+        st.session_state["token_usage"] = {"prompt": 0, "completion": 0, "cost": 0.0}
+    
+    # Inicjalizacja zmiennych dla załączników
+    if "attachments" not in st.session_state:
+        st.session_state["attachments"] = []
 
-        if st.button("Nowa konwersacja", key="new_conversation"):
-            conversation_id = db.create_conversation(st.session_state["user_id"])
-            st.session_state["current_conversation_id"] = conversation_id
+    if "attached_images" not in st.session_state:
+        st.session_state["attached_images"] = {}
+
+    # Pobierz wiadomości
+    messages = db.get_messages(current_conversation_id)
+    
+    # Wyświetl istniejące wiadomości
+    for message in messages:
+        role = message["role"]
+        content = format_message_for_display(message)
+
+        if role == "user":
+            with st.chat_message("user"):
+                st.markdown(content)
+                # Wyświetl załączniki jeśli istnieją - tylko obrazy
+                for attachment in message.get("attachments", []):
+                    if attachment.get("type") == "image":
+                        try:
+                            # Załączniki obrazów są trzymane w sesji, a nie w DB
+                            if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
+                                img_data = st.session_state["attached_images"][attachment.get("name")]
+                                st.image(img_data, caption=attachment.get("name", "Załącznik"))
+                        except Exception as e:
+                            pass
+
+        elif role == "assistant":
+            with st.chat_message("assistant"):
+                st.markdown(content)
+
+    # Wyświetlanie załączników (jako tekst pod polem wejściowym)
+    if st.session_state["attachments"]:
+        attachment_text = "Załączniki: " + " ".join([
+            f"<span class='attachment-badge'>{attachment.get('type')} | {attachment.get('name')[:15]}...</span>"
+            for attachment in st.session_state["attachments"]
+        ])
+        st.markdown(f"<div style='margin-bottom: 5px'>{attachment_text}</div>", unsafe_allow_html=True)
+    
+    # Ukryte przyciski do obsługi załączników (uruchamiane przez JavaScript)
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        if st.button("Obraz", key="btn_img", help="Dodaj obraz"):
+            st.session_state["show_image_uploader"] = not st.session_state.get("show_image_uploader", False)
             st.rerun()
-
-        st.subheader("Twoje konwersacje")
-
-        conversations = db.get_conversations(st.session_state["user_id"])
-        for conv in conversations:
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                if st.button(conv["title"], key=f"conv_{conv['id']}", use_container_width=True):
-                    st.session_state["current_conversation_id"] = conv["id"]
+    
+    with col2:
+        if st.button("Plik", key="btn_file", help="Dodaj plik"):
+            st.session_state["show_file_uploader"] = not st.session_state.get("show_file_uploader", False)
+            st.rerun()
+    
+    with col3:
+        if st.button("Kod", key="btn_code", help="Dodaj kod"):
+            st.session_state["show_code_input"] = not st.session_state.get("show_code_input", False)
+            st.rerun()
+    
+    # Zarządzanie istniejącymi załącznikami
+    if st.session_state["attachments"]:
+        cols = st.columns(len(st.session_state["attachments"]))
+        for i, (col, attachment) in enumerate(zip(cols, st.session_state["attachments"])):
+            with col:
+                if st.button(f"❌ {attachment.get('name', '')[:7]}...", key=f"del_{i}"):
+                    if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
+                        del st.session_state["attached_images"][attachment.get("name")]
+                    st.session_state["attachments"].pop(i)
                     st.rerun()
-            with col2:
-                if st.button("🗑️", key=f"delete_{conv['id']}"):
-                    db.delete_conversation(conv["id"])
-                    if st.session_state["current_conversation_id"] == conv["id"]:
-                        st.session_state["current_conversation_id"] = None
-                    st.rerun()
 
-        if st.button("Wyloguj się", key="logout"):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
-
-    # Główny obszar konwersacji
-    if st.session_state["current_conversation_id"]:
-        conversation_id = st.session_state["current_conversation_id"]
-
-        # Pobierz tytuł konwersacji
-        conversations = db.get_conversations(st.session_state["user_id"])
-        current_conversation = next((c for c in conversations if c["id"] == conversation_id), None)
-
-        if current_conversation:
-            # Edytowalny tytuł konwersacji
-            new_title = st.text_input("Tytuł konwersacji", value=current_conversation["title"], key="conversation_title")
-            if new_title != current_conversation["title"]:
-                db.update_conversation_title(conversation_id, new_title)
-                st.rerun()
-
-        # Wyświetlanie wiadomości
-        messages = db.get_messages(conversation_id)
-
-        # Kontener na wiadomości
-        message_container = st.container()
-
-        with message_container:
-            for msg in messages:
-                if msg["role"] == "user":
-                    with st.chat_message("user"):
-                        st.write(msg["content"])
-
-                        # Wyświetlanie załączników
-                        if msg["attachments"]:
-                            for attachment in msg["attachments"]:
-                                if attachment["type"] == "image":
-                                    st.image(attachment["data"])
-                                elif attachment["type"] == "text":
-                                    with st.expander("Załącznik tekstowy"):
-                                        st.text(attachment["data"])
-                                elif attachment["type"] == "code":
-                                    with st.expander(f"Kod ({attachment['language']})"):
-                                        st.code(attachment["data"], language=attachment["language"])
-
-                elif msg["role"] == "assistant":
-                    with st.chat_message("assistant"):
-                        # Przetwarzanie bloków kodu w odpowiedzi
-                        processed_content = process_code_blocks(msg["content"])
-                        st.markdown(processed_content)
-
-        # Ukryty przycisk do obsługi kliknięcia przycisku załącznika
-        if "show_attachment_menu" not in st.session_state:
-            st.session_state["show_attachment_menu"] = False
-
-        # Ukryty przycisk, który będzie kliknięty przez JavaScript
-        button_clicked = st.button('📎', key='attach_button_trigger', help="Dodaj załącznik", style="display: none;")
-        if button_clicked:
-            st.session_state["show_attachment_menu"] = not st.session_state["show_attachment_menu"]
-            st.rerun()
-
-        # Pole wejściowe użytkownika
-        user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
-
-        # Wyświetlanie menu załączników, jeśli zostało aktywowane
-        if st.session_state["show_attachment_menu"]:
-            with st.container():
-                st.markdown("<div style='background-color: white; padding: 10px; border-radius: 5px; border: 1px solid #ddd; margin-bottom: 10px;'>", unsafe_allow_html=True)
-                st.write("Wybierz typ załącznika:")
-
-                col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-
-                with col1:
-                    if st.button("📷 Obraz", use_container_width=True):
-                        st.session_state["show_image_uploader"] = True
-                        st.session_state["show_file_uploader"] = False
-                        st.session_state["show_code_input"] = False
-                        st.session_state["show_attachment_menu"] = False
-                        st.rerun()
-
-                with col2:
-                    if st.button("📄 Plik", use_container_width=True):
-                        st.session_state["show_image_uploader"] = False
-                        st.session_state["show_file_uploader"] = True
-                        st.session_state["show_code_input"] = False
-                        st.session_state["show_attachment_menu"] = False
-                        st.rerun()
-
-                with col3:
-                    if st.button("💻 Kod", use_container_width=True):
-                        st.session_state["show_image_uploader"] = False
-                        st.session_state["show_file_uploader"] = False
-                        st.session_state["show_code_input"] = True
-                        st.session_state["show_attachment_menu"] = False
-                        st.rerun()
-
-                with col4:
-                    if st.button("❌ Anuluj", use_container_width=True):
-                        st.session_state["show_attachment_menu"] = False
-                        st.rerun()
-
-                st.markdown("</div>", unsafe_allow_html=True)
-
-        # Obsługa przesyłania obrazu
-        if st.session_state["show_image_uploader"]:
-            uploaded_image = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_uploader")
-
+    # Formularze załączników
+    if st.session_state.get("show_image_uploader", False):
+        with st.expander("Dodaj obraz", expanded=True):
+            uploaded_file = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_upload")
             col1, col2 = st.columns([1, 1])
             with col1:
-                if st.button("Dodaj obraz", key="add_image"):
-                    if uploaded_image:
-                        # Kodowanie obrazu do base64
-                        image_data = encode_image(uploaded_image)
-
-                        # Dodanie wiadomości z załącznikiem obrazu
-                        db.add_message(
-                            conversation_id, 
-                            "user", 
-                            "Załączony obraz:",
-                            [{"type": "image", "data": image_data}]
-                        )
-
-                        # Generowanie odpowiedzi asystenta
-                        messages = db.get_messages(conversation_id)
-                        formatted_messages = [{"role": msg["role"], "content": msg["content"], "attachments": msg["attachments"]} for msg in messages]
-
-                        with st.spinner("Generowanie odpowiedzi..."):
-                            assistant_response = llm_service.generate_response(formatted_messages)
-                            db.add_message(conversation_id, "assistant", assistant_response)
-
-                        # Resetowanie stanu
-                        st.session_state["show_image_uploader"] = False
-                        st.rerun()
-
-            with col2:
-                if st.button("Anuluj", key="cancel_image"):
+                if st.button("Anuluj", use_container_width=True):
                     st.session_state["show_image_uploader"] = False
                     st.rerun()
+            with col2:
+                if uploaded_file is not None and st.button("Dodaj", use_container_width=True):
+                    image_name = uploaded_file.name
+                    st.session_state["attached_images"][image_name] = uploaded_file.getvalue()
+                    st.session_state["attachments"].append({
+                        "type": "image",
+                        "name": image_name
+                    })
+                    st.session_state["show_image_uploader"] = False
+                    st.success(f"Dodano obraz: {image_name}")
+                    st.rerun()
 
-        # Obsługa przesyłania pliku
-        if st.session_state["show_file_uploader"]:
-            uploaded_file = st.file_uploader("Wybierz plik tekstowy", type=["txt", "md", "py", "js", "html", "css", "json", "csv"], key="file_uploader")
-
+    if st.session_state.get("show_file_uploader", False):
+        with st.expander("Dodaj plik tekstowy", expanded=True):
+            uploaded_file = st.file_uploader("Wybierz plik", type=["txt", "md", "json", "csv"], key="text_upload")
             col1, col2 = st.columns([1, 1])
             with col1:
-                if st.button("Dodaj plik", key="add_file"):
-                    if uploaded_file:
-                        # Odczytanie zawartości pliku
-                        file_content = read_text_file(uploaded_file)
-
-                        # Dodanie wiadomości z załącznikiem tekstowym
-                        db.add_message(
-                            conversation_id, 
-                            "user", 
-                            f"Załączony plik: {uploaded_file.name}",
-                            [{"type": "text", "data": file_content}]
-                        )
-
-                        # Generowanie odpowiedzi asystenta
-                        messages = db.get_messages(conversation_id)
-                        formatted_messages = [{"role": msg["role"], "content": msg["content"], "attachments": msg["attachments"]} for msg in messages]
-
-                        with st.spinner("Generowanie odpowiedzi..."):
-                            assistant_response = llm_service.generate_response(formatted_messages)
-                            db.add_message(conversation_id, "assistant", assistant_response)
-
-                        # Resetowanie stanu
-                        st.session_state["show_file_uploader"] = False
-                        st.rerun()
-
-            with col2:
-                if st.button("Anuluj", key="cancel_file"):
+                if st.button("Anuluj", use_container_width=True):
                     st.session_state["show_file_uploader"] = False
                     st.rerun()
+            with col2:
+                if uploaded_file is not None and st.button("Dodaj", use_container_width=True):
+                    try:
+                        text_content = uploaded_file.getvalue().decode("utf-8")
+                        st.session_state["attachments"].append({
+                            "type": "file",
+                            "name": uploaded_file.name,
+                            "text_content": text_content
+                        })
+                        st.session_state["show_file_uploader"] = False
+                        st.success(f"Dodano plik: {uploaded_file.name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Błąd odczytu pliku: {str(e)}")
 
-        # Obsługa wprowadzania kodu
-        if st.session_state["show_code_input"]:
-            language = st.selectbox("Język programowania", ["python", "javascript", "html", "css", "sql", "bash", "json", "plaintext"])
-            code_content = st.text_area("Wklej swój kod", height=200)
+    if st.session_state.get("show_code_input", False):
+        with st.expander("Dodaj kod", expanded=True):
+            code_language = st.selectbox("Język programowania", 
+                                         ["python", "javascript", "html", "css", "json", "sql", "bash"], 
+                                         key="code_language")
+            code_content = st.text_area("Wklej kod", height=150, key="code_content")
+            file_name = st.text_input("Nazwa pliku (opcjonalnie)", 
+                                      value=f"code.{code_language}", 
+                                      key="code_filename")
 
             col1, col2 = st.columns([1, 1])
             with col1:
-                if st.button("Dodaj kod", key="add_code"):
-                    if code_content:
-                        # Dodanie wiadomości z załącznikiem kodu
-                        db.add_message(
-                            conversation_id, 
-                            "user", 
-                            f"Załączony kod ({language}):",
-                            [{"type": "code", "language": language, "data": code_content}]
-                        )
-
-                        # Generowanie odpowiedzi asystenta
-                        messages = db.get_messages(conversation_id)
-                        formatted_messages = [{"role": msg["role"], "content": msg["content"], "attachments": msg["attachments"]} for msg in messages]
-
-                        with st.spinner("Generowanie odpowiedzi..."):
-                            assistant_response = llm_service.generate_response(formatted_messages)
-                            db.add_message(conversation_id, "assistant", assistant_response)
-
-                        # Resetowanie stanu
-                        st.session_state["show_code_input"] = False
-                        st.rerun()
-
-            with col2:
-                if st.button("Anuluj", key="cancel_code"):
+                if st.button("Anuluj", use_container_width=True):
                     st.session_state["show_code_input"] = False
                     st.rerun()
+            with col2:
+                if code_content and st.button("Dodaj", use_container_width=True):
+                    st.session_state["attachments"].append({
+                        "type": "file",
+                        "name": file_name,
+                        "text_content": f"```{code_language}\n{code_content}\n```"
+                    })
+                    st.session_state["show_code_input"] = False
+                    st.success(f"Dodano kod: {file_name}")
+                    st.rerun()
+    
+    # Pole wejściowe użytkownika - ostatni element
+    user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
 
-        # Obsługa wysyłania wiadomości tekstowej
-        if user_input:
-            # Dodanie wiadomości użytkownika
-            db.add_message(conversation_id, "user", user_input)
+    # Obsługa wprowadzonego komunikatu
+    if user_input:
+        # Natychmiast wyświetl wiadomość użytkownika
+        with st.chat_message("user"):
+            st.markdown(user_input)
+            # Pokaż załączniki obrazów
+            for attachment in st.session_state.get("attachments", []):
+                if attachment.get("type") == "image":
+                    try:
+                        if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
+                            img_data = st.session_state["attached_images"][attachment.get("name")]
+                            st.image(img_data, caption=attachment.get("name", "Załącznik"))
+                    except Exception as e:
+                        pass
+        
+        # Przygotuj treść wiadomości i załączniki
+        message_content = user_input
 
-            # Generowanie odpowiedzi asystenta
-            messages = db.get_messages(conversation_id)
-            formatted_messages = [{"role": msg["role"], "content": msg["content"], "attachments": msg["attachments"]} for msg in messages]
+        # Kopiujemy załączniki ze stanu sesji
+        attachments_to_send = []
+        for attachment in st.session_state.get("attachments", []):
+            attachment_copy = attachment.copy()
+            attachments_to_send.append(attachment_copy)
 
+        # Dodaj informacje o załącznikach do treści wiadomości
+        if attachments_to_send:
+            attachment_descriptions = []
+            for attachment in attachments_to_send:
+                if attachment.get("type") == "image":
+                    attachment_descriptions.append(f"[Załącznik obrazu: {attachment.get('name', 'image')}]")
+                elif attachment.get("type") == "file" and attachment.get("text_content"):
+                    attachment_descriptions.append(f"[Załącznik pliku: {attachment.get('name', 'file')}]\n{attachment.get('text_content')}")
+
+            if attachment_descriptions:
+                message_content += "\n\n" + "\n\n".join(attachment_descriptions)
+
+        # Sprawdź, czy konwersacja ma tytuł
+        if len(messages) == 0:
+            conversation_title = get_conversation_title([{"role": "user", "content": user_input}], llm_service, st.session_state["api_key"])
+            db.save_conversation(current_conversation_id, conversation_title)
+
+        # Zapisz wiadomość użytkownika w bazie danych
+        db.save_message(current_conversation_id, "user", user_input, attachments_to_send)
+
+        # Przygotuj wiadomości dla API
+        api_messages = []
+        for msg in messages:
+            api_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+
+        # Dodaj aktualną wiadomość użytkownika
+        api_messages.append({"role": "user", "content": message_content})
+
+        # Wyświetl oczekującą odpowiedź asystenta
+        with st.chat_message("assistant"):
             with st.spinner("Generowanie odpowiedzi..."):
-                assistant_response = llm_service.generate_response(formatted_messages)
-                db.add_message(conversation_id, "assistant", assistant_response)
+                try:
+                    model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
+                    system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
+                    temperature = st.session_state.get("temperature", 0.7)
 
-            st.rerun()
+                    response = llm_service.call_llm(
+                        messages=api_messages,
+                        model=model,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                        max_tokens=12000
+                    )
 
-    else:
-        st.title("FloorDev AI Assistant")
-        st.write("Wybierz konwersację z listy lub utwórz nową, aby rozpocząć.")
+                    assistant_response = response["choices"][0]["message"]["content"]
 
-# Główna funkcja aplikacji
+                    # Aktualizuj statystyki tokenów
+                    if "usage" in response:
+                        usage = response["usage"]
+                        st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
+                        st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+
+                        # Oblicz koszt
+                        cost = calculate_cost(
+                            model, 
+                            usage["prompt_tokens"], 
+                            usage["completion_tokens"]
+                        )
+
+                        st.session_state["token_usage"]["cost"] += cost
+
+                    # Zapisz odpowiedź asystenta
+                    db.save_message(current_conversation_id, "assistant", assistant_response)
+                    
+                    # Wyświetl odpowiedź
+                    st.markdown(assistant_response)
+                    
+                    # Wyczyść załączniki po wysłaniu
+                    st.session_state["attachments"] = []
+                    # Ukryj formularze załączników
+                    st.session_state["show_image_uploader"] = False
+                    st.session_state["show_file_uploader"] = False  
+                    st.session_state["show_code_input"] = False
+                    
+                    # Odśwież stronę aby wyświetlić nową wiadomość bez spinnerów
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Wystąpił błąd: {str(e)}")
+
+# === Główna aplikacja ===
 def main():
-    if not st.session_state["logged_in"]:
+    st.set_page_config(
+        page_title="AI Asystent Developera Streamlit",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Inicjalizacja serwisów
+    if "db" not in st.session_state:
+        st.session_state["db"] = AssistantDB()
+    
+    # Sprawdź autentykację
+    if not st.session_state.get("authenticated", False):
         login_page()
-    else:
-        main_page()
+        return
+    
+    # Pobierz klucz API z secrets
+    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if api_key and "llm_service" not in st.session_state:
+        st.session_state["llm_service"] = LLMService(api_key)
+        st.session_state["api_key"] = api_key
+    
+    # Wyświetl sidebar
+    sidebar_component()
+    
+    # Wyświetl główny komponent czatu
+    chat_component()
 
 if __name__ == "__main__":
     main()
