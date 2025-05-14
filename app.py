@@ -372,7 +372,7 @@ class LLMService:
                 model: str = "anthropic/claude-3.7-sonnet:floor", 
                 system_prompt: str = None, 
                 temperature: float = 0.7, 
-                max_tokens: int = 4000,
+                max_tokens: int = 8000,  # Zwiększenie max_tokens dla dłuższych odpowiedzi
                 use_cache: bool = True) -> Dict[str, Any]:
         """Wywołaj API LLM przez OpenRouter z opcjonalnym cachowaniem"""
         # Sprawdź pamięć podręczną, jeśli używamy cachowania
@@ -412,7 +412,7 @@ class LLMService:
                         "temperature": temperature,
                         "max_tokens": max_tokens
                     },
-                    timeout=30
+                    timeout=60  # Zwiększenie timeout dla dłuższych odpowiedzi
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -545,6 +545,13 @@ def sidebar_component():
             
             st.session_state["custom_system_prompt"] = custom_system_prompt
         
+        # Statystyki tokenów - przeniesione z głównego widoku do paska bocznego
+        if "token_usage" in st.session_state:
+            with st.sidebar.expander("📊 Statystyki tokenów", expanded=False):
+                st.metric("Tokeny prompt", st.session_state["token_usage"]["prompt"])
+                st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
+                st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
+        
         # Lista konwersacji
         db = st.session_state.get("db")
         if db:
@@ -577,7 +584,7 @@ def sidebar_component():
 @requires_auth
 def chat_component():
     """Komponent interfejsu czatu"""
-    st.title("💬 Chat Asystent Developera Streamlit")
+    # Usunięcie nagłówka tytułowego
 
     # Pobierz klucz API z secrets
     api_key = st.secrets.get("OPENROUTER_API_KEY", "")
@@ -605,64 +612,14 @@ def chat_component():
 
     current_conversation_id = st.session_state["current_conversation_id"]
 
-    # Statystyki konwersacji
+    # Statystyki konwersacji - przeniesione do paska bocznego
     if "token_usage" not in st.session_state:
         st.session_state["token_usage"] = {"prompt": 0, "completion": 0, "cost": 0.0}
-
-    with st.expander("📊 Statystyki tokenów", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Tokeny prompt", st.session_state["token_usage"]["prompt"])
-        with col2:
-            st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
-        with col3:
-            st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
-
-    # Dodajemy niestandardowy CSS dla układu czatu
-    st.markdown("""
-    <style>
-    .chat-container {
-        display: flex;
-        flex-direction: column;
-        height: 70vh;
-        border: 1px solid #e0e0e0;
-        border-radius: 10px;
-        overflow: hidden;
-        margin-bottom: 1rem;
-    }
-    .messages-container {
-        flex: 1;
-        overflow-y: auto;
-        padding: 1rem;
-        display: flex;
-        flex-direction: column;
-    }
-    .input-container {
-        border-top: 1px solid #e0e0e0;
-        padding: 1rem;
-        background-color: #f9f9f9;
-    }
-    .stChatInputContainer {
-        position: sticky;
-        bottom: 0;
-        background-color: white;
-        padding: 1rem 0;
-        border-top: 1px solid #e0e0e0;
-        z-index: 100;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Tworzymy kontener główny dla czatu z dwoma sekcjami
-    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-
-    # 1. Sekcja wiadomości (przewijalna)
-    st.markdown('<div class="messages-container" id="messages-container">', unsafe_allow_html=True)
 
     # Pobierz wiadomości
     messages = db.get_messages(current_conversation_id)
 
-    # Wyświetl istniejące wiadomości
+    # Wyświetl istniejące wiadomości - teraz na całej szerokości strony
     for message in messages:
         role = message["role"]
         content = format_message_for_display(message)
@@ -670,9 +627,9 @@ def chat_component():
         if role == "user":
             with st.chat_message("user"):
                 st.markdown(content)
-                # Wyświetl załączniki jeśli istnieją
+                # Wyświetl załączniki jeśli istnieją - tylko obrazy, bez wyświetlania tekstu załączników
                 for attachment in message.get("attachments", []):
-                    if attachment.get("type") == "image" and "data" in attachment:
+                    if attachment.get("type") == "image":
                         try:
                             # Załączniki obrazów są trzymane w sesji, a nie w DB
                             if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
@@ -680,49 +637,64 @@ def chat_component():
                                 st.image(img_data, caption=attachment.get("name", "Załącznik"))
                         except Exception as e:
                             st.error(f"Nie można wyświetlić obrazu: {str(e)}")
-                    elif attachment.get("type") == "file" and "text_content" in attachment:
-                        st.code(attachment.get("text_content", ""), language="text")
 
         elif role == "assistant":
             with st.chat_message("assistant"):
                 st.markdown(content)
 
-    # Zamknij sekcję wiadomości
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # 2. Sekcja wprowadzania (stała na dole)
-    st.markdown('<div class="input-container">', unsafe_allow_html=True)
-
-    # Kontener na załączniki
+    # Inicjalizacja zmiennych dla załączników
     if "attachments" not in st.session_state:
         st.session_state["attachments"] = []
 
-    # Zarządzanie załącznikami obrazów w sesji
     if "attached_images" not in st.session_state:
         st.session_state["attached_images"] = {}
 
-    # Wyświetl aktualnie dodane załączniki
+    # Integracja załączników z polem wprowadzania - kompaktowy widok
+    # Pole wprowadzania z przyciskami załączników obok
+    col1, col2 = st.columns([6, 1])
+    
+    with col1:
+        user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
+
+    with col2:
+        st.markdown("<div style='height: 24px'></div>", unsafe_allow_html=True)  # Spacer dla wyrównania z polem wprowadzania
+        attachment_col1, attachment_col2, attachment_col3 = st.columns(3)
+        
+        with attachment_col1:
+            if st.button("📷", help="Dodaj obraz"):
+                st.session_state["show_image_uploader"] = not st.session_state.get("show_image_uploader", False)
+                st.rerun()
+                
+        with attachment_col2:
+            if st.button("📄", help="Dodaj plik"):
+                st.session_state["show_file_uploader"] = not st.session_state.get("show_file_uploader", False)
+                st.rerun()
+                
+        with attachment_col3:
+            if st.button("💻", help="Dodaj kod"):
+                st.session_state["show_code_input"] = not st.session_state.get("show_code_input", False)
+                st.rerun()
+
+    # Pokaż liczbę załączników
     if st.session_state["attachments"]:
-        st.write("Załączniki do wysłania:")
-        cols = st.columns(4)
+        st.caption(f"Załączniki: {len(st.session_state['attachments'])}")
+        
+        # Pokaż załączniki w jednej linii jako przyciski do usunięcia
+        cols = st.columns(min(4, len(st.session_state["attachments"])))
         for i, attachment in enumerate(st.session_state["attachments"]):
-            with cols[i % 4]:
-                st.write(f"📎 {attachment.get('name', 'Załącznik')}")
-                if st.button("Usuń", key=f"remove_{i}"):
+            with cols[i % len(cols)]:
+                if st.button(f"❌ {attachment.get('name', 'Załącznik')[:10]}...", key=f"remove_{i}"):
                     # Jeśli to obraz, usuń też z pamięci sesji
                     if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
                         del st.session_state["attached_images"][attachment.get("name")]
-
                     st.session_state["attachments"].pop(i)
                     st.rerun()
 
-    # Dodaj załączniki
-    with st.expander("📎 Dodaj załącznik", expanded=False):
-        attachment_type = st.radio("Typ załącznika", ["Obraz", "Plik tekstowy", "Kod"])
-
-        if attachment_type == "Obraz":
+    # Formularze załączników - pokazywane tylko gdy użytkownik kliknie odpowiedni przycisk
+    if st.session_state.get("show_image_uploader", False):
+        with st.expander("Dodaj obraz", expanded=True):
             uploaded_file = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_upload")
-            if uploaded_file is not None and st.button("Dodaj obraz"):
+            if uploaded_file is not None and st.button("Dodaj"):
                 # Zapisujemy obraz w pamięci sesji, a nie w załącznikach
                 image_name = uploaded_file.name
                 st.session_state["attached_images"][image_name] = uploaded_file.getvalue()
@@ -732,12 +704,14 @@ def chat_component():
                     "type": "image",
                     "name": image_name
                 })
+                st.session_state["show_image_uploader"] = False
                 st.success(f"Dodano obraz: {image_name}")
                 st.rerun()
 
-        elif attachment_type == "Plik tekstowy":
+    if st.session_state.get("show_file_uploader", False):
+        with st.expander("Dodaj plik tekstowy", expanded=True):
             uploaded_file = st.file_uploader("Wybierz plik", type=["txt", "md", "json", "csv"], key="text_upload")
-            if uploaded_file is not None and st.button("Dodaj plik"):
+            if uploaded_file is not None and st.button("Dodaj"):
                 try:
                     text_content = uploaded_file.getvalue().decode("utf-8")
                     st.session_state["attachments"].append({
@@ -745,61 +719,29 @@ def chat_component():
                         "name": uploaded_file.name,
                         "text_content": text_content
                     })
+                    st.session_state["show_file_uploader"] = False
                     st.success(f"Dodano plik: {uploaded_file.name}")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Błąd odczytu pliku: {str(e)}")
 
-        elif attachment_type == "Kod":
-            code_language = st.selectbox("Język programowania", ["python", "javascript", "html", "css", "json", "sql", "bash"])
-            code_content = st.text_area("Wklej kod", height=150)
-            file_name = st.text_input("Nazwa pliku (opcjonalnie)", value=f"code.{code_language}")
+    if st.session_state.get("show_code_input", False):
+        with st.expander("Dodaj kod", expanded=True):
+            code_language = st.selectbox("Język programowania", ["python", "javascript", "html", "css", "json", "sql", "bash"], key="code_language")
+            code_content = st.text_area("Wklej kod", height=150, key="code_content")
+            file_name = st.text_input("Nazwa pliku (opcjonalnie)", value=f"code.{code_language}", key="code_filename")
 
-            if code_content and st.button("Dodaj kod"):
+            if st.button("Dodaj") and code_content:
                 st.session_state["attachments"].append({
                     "type": "file",
                     "name": file_name,
                     "text_content": f"```{code_language}\n{code_content}\n```"
                 })
+                st.session_state["show_code_input"] = False
                 st.success(f"Dodano kod: {file_name}")
                 st.rerun()
 
-    # Input użytkownika - zawsze na dole
-    user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
-
-    # Zamknij sekcję wprowadzania
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # Zamknij główny kontener czatu
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # Dodaj JavaScript do automatycznego przewijania do najnowszych wiadomości
-    st.markdown("""
-    <script>
-    // Funkcja do przewijania kontenera wiadomości na dół
-    function scrollMessagesToBottom() {
-        const messagesContainer = document.getElementById('messages-container');
-        if (messagesContainer) {
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }
-    }
-
-    // Wywołaj funkcję po załadowaniu strony
-    window.addEventListener('load', scrollMessagesToBottom);
-
-    // Wywołuj funkcję co 500ms przez 2 sekundy po załadowaniu
-    // (aby obsłużyć opóźnione renderowanie wiadomości)
-    let scrollCount = 0;
-    const scrollInterval = setInterval(() => {
-        scrollMessagesToBottom();
-        scrollCount++;
-        if (scrollCount >= 4) {
-            clearInterval(scrollInterval);
-        }
-    }, 500);
-    </script>
-    """, unsafe_allow_html=True)
-
+    # Obsługa wprowadzenia użytkownika
     if user_input:
         # Przygotuj treść wiadomości i załączniki
         message_content = user_input
@@ -852,7 +794,8 @@ def chat_component():
                     messages=api_messages,
                     model=model,
                     system_prompt=system_prompt,
-                    temperature=temperature
+                    temperature=temperature,
+                    max_tokens=8000  # Zwiększenie dla dłuższych odpowiedzi
                 )
 
                 assistant_response = response["choices"][0]["message"]["content"]
@@ -877,6 +820,13 @@ def chat_component():
 
                 # Wyczyść załączniki po wysłaniu
                 st.session_state["attachments"] = []
+                # Ukryj wszystkie formularze załączników
+                st.session_state["show_image_uploader"] = False
+                st.session_state["show_file_uploader"] = False  
+                st.session_state["show_code_input"] = False
+                
+                # Odśwież stronę, aby wyświetlić nową wiadomość
+                st.rerun()
                 
             except Exception as e:
                 st.error(f"Wystąpił błąd: {str(e)}")
