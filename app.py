@@ -578,37 +578,37 @@ def sidebar_component():
 def chat_component():
     """Komponent interfejsu czatu"""
     st.title("💬 Chat Asystent Developera Streamlit")
-    
+
     # Pobierz klucz API z secrets
     api_key = st.secrets.get("OPENROUTER_API_KEY", "")
     if not api_key:
         st.warning("⚠️ Brak klucza API OpenRouter w ustawieniach secrets.")
         return
-    
+
     # Aktualizuj klucz API w sesji
     st.session_state["api_key"] = api_key
-    
+
     # Pobierz instancję serwisu LLM i bazy danych
     if "llm_service" not in st.session_state or st.session_state.get("llm_service") is None:
         st.session_state["llm_service"] = LLMService(api_key)
-    
+
     llm_service = st.session_state.get("llm_service")
     db = st.session_state.get("db")
-    
+
     if not llm_service or not db:
         st.error("⚠️ Nie można zainicjalizować serwisów. Odśwież stronę i spróbuj ponownie.")
         return
-    
+
     # Inicjalizacja zmiennych sesji dla konwersacji
     if "current_conversation_id" not in st.session_state:
         st.session_state["current_conversation_id"] = str(uuid.uuid4())
-    
+
     current_conversation_id = st.session_state["current_conversation_id"]
-    
+
     # Statystyki konwersacji
     if "token_usage" not in st.session_state:
         st.session_state["token_usage"] = {"prompt": 0, "completion": 0, "cost": 0.0}
-    
+
     with st.expander("📊 Statystyki tokenów", expanded=False):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -617,214 +617,266 @@ def chat_component():
             st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
         with col3:
             st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
-    
-    # Użyj układu kolumn, aby zapewnić stały layout
-    main_container = st.container()
-    
+
+    # Dodajemy niestandardowy CSS dla układu czatu
+    st.markdown("""
+    <style>
+    .chat-container {
+        display: flex;
+        flex-direction: column;
+        height: 70vh;
+        border: 1px solid #e0e0e0;
+        border-radius: 10px;
+        overflow: hidden;
+        margin-bottom: 1rem;
+    }
+    .messages-container {
+        flex: 1;
+        overflow-y: auto;
+        padding: 1rem;
+        display: flex;
+        flex-direction: column;
+    }
+    .input-container {
+        border-top: 1px solid #e0e0e0;
+        padding: 1rem;
+        background-color: #f9f9f9;
+    }
+    .stChatInputContainer {
+        position: sticky;
+        bottom: 0;
+        background-color: white;
+        padding: 1rem 0;
+        border-top: 1px solid #e0e0e0;
+        z-index: 100;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Tworzymy kontener główny dla czatu z dwoma sekcjami
+    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+
+    # 1. Sekcja wiadomości (przewijalna)
+    st.markdown('<div class="messages-container" id="messages-container">', unsafe_allow_html=True)
+
     # Pobierz wiadomości
     messages = db.get_messages(current_conversation_id)
-    
-    # Kontener na załączniki i pole wprowadzania na dole ekranu
-    input_area = st.container()
-    
-    # Wysokość obszaru czatu z możliwością przewijania
-    chat_height = 600  # Możesz dostosować tę wartość
-    
-    # Wyświetl istniejące wiadomości w przewijalnym obszarze
-    with main_container:
-        # Usuwamy wiadomość powitalną
-        for message in messages:
-            role = message["role"]
-            content = format_message_for_display(message)
-            
-            if role == "user":
-                with st.chat_message("user"):
-                    st.markdown(content)
-                    # Wyświetl załączniki jeśli istnieją
-                    for attachment in message.get("attachments", []):
-                        if attachment.get("type") == "image" and "data" in attachment:
-                            try:
-                                # Załączniki obrazów są trzymane w sesji, a nie w DB
-                                if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
-                                    img_data = st.session_state["attached_images"][attachment.get("name")]
-                                    st.image(img_data, caption=attachment.get("name", "Załącznik"))
-                            except Exception as e:
-                                st.error(f"Nie można wyświetlić obrazu: {str(e)}")
-                        elif attachment.get("type") == "file" and "text_content" in attachment:
-                            st.code(attachment.get("text_content", ""), language="text")
-            
-            elif role == "assistant":
-                with st.chat_message("assistant"):
-                    st.markdown(content)
-    
-    # Obszar wprowadzania zawsze na dole
-    with input_area:
-        st.write("---")
-        
-        # Kontener na załączniki
-        if "attachments" not in st.session_state:
-            st.session_state["attachments"] = []
-        
-        # Zarządzanie załącznikami obrazów w sesji
-        if "attached_images" not in st.session_state:
-            st.session_state["attached_images"] = {}
-        
-        # Wyświetl aktualnie dodane załączniki
-        if st.session_state["attachments"]:
-            st.write("Załączniki do wysłania:")
-            cols = st.columns(4)
-            for i, attachment in enumerate(st.session_state["attachments"]):
-                with cols[i % 4]:
-                    st.write(f"📎 {attachment.get('name', 'Załącznik')}")
-                    if st.button("Usuń", key=f"remove_{i}"):
-                        # Jeśli to obraz, usuń też z pamięci sesji
-                        if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
-                            del st.session_state["attached_images"][attachment.get("name")]
-                        
-                        st.session_state["attachments"].pop(i)
-                        st.rerun()
-        
-        # Dodaj załączniki
-        with st.expander("📎 Dodaj załącznik", expanded=False):
-            attachment_type = st.radio("Typ załącznika", ["Obraz", "Plik tekstowy", "Kod"])
-            
-            if attachment_type == "Obraz":
-                uploaded_file = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_upload")
-                if uploaded_file is not None and st.button("Dodaj obraz"):
-                    # Zapisujemy obraz w pamięci sesji, a nie w załącznikach
-                    image_name = uploaded_file.name
-                    st.session_state["attached_images"][image_name] = uploaded_file.getvalue()
-                    
-                    # Do załączników dodajemy tylko referencję
-                    st.session_state["attachments"].append({
-                        "type": "image",
-                        "name": image_name
-                    })
-                    st.success(f"Dodano obraz: {image_name}")
-                    st.rerun()
-            
-            elif attachment_type == "Plik tekstowy":
-                uploaded_file = st.file_uploader("Wybierz plik", type=["txt", "md", "json", "csv"], key="text_upload")
-                if uploaded_file is not None and st.button("Dodaj plik"):
-                    try:
-                        text_content = uploaded_file.getvalue().decode("utf-8")
-                        st.session_state["attachments"].append({
-                            "type": "file",
-                            "name": uploaded_file.name,
-                            "text_content": text_content
-                        })
-                        st.success(f"Dodano plik: {uploaded_file.name}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Błąd odczytu pliku: {str(e)}")
-            
-            elif attachment_type == "Kod":
-                code_language = st.selectbox("Język programowania", ["python", "javascript", "html", "css", "json", "sql", "bash"])
-                code_content = st.text_area("Wklej kod", height=150)
-                file_name = st.text_input("Nazwa pliku (opcjonalnie)", value=f"code.{code_language}")
-                
-                if code_content and st.button("Dodaj kod"):
-                    st.session_state["attachments"].append({
-                        "type": "file",
-                        "name": file_name,
-                        "text_content": f"```{code_language}\n{code_content}\n```"
-                    })
-                    st.success(f"Dodano kod: {file_name}")
-                    st.rerun()
-        
-        # Input użytkownika - zawsze na dole
-        user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
-        
-        if user_input:
-            # Przygotuj treść wiadomości i załączniki
-            message_content = user_input
-            
-            # Kopiujemy załączniki ze stanu sesji
-            attachments_to_send = []
-            for attachment in st.session_state.get("attachments", []):
-                attachment_copy = attachment.copy()
-                attachments_to_send.append(attachment_copy)
-            
-            # Dodaj informacje o załącznikach do treści wiadomości
-            if attachments_to_send:
-                attachment_descriptions = []
-                for attachment in attachments_to_send:
-                    if attachment.get("type") == "image":
-                        attachment_descriptions.append(f"[Załącznik obrazu: {attachment.get('name', 'image')}]")
-                    elif attachment.get("type") == "file" and attachment.get("text_content"):
-                        attachment_descriptions.append(f"[Załącznik pliku: {attachment.get('name', 'file')}]\n{attachment.get('text_content')}")
-                
-                if attachment_descriptions:
-                    message_content += "\n\n" + "\n\n".join(attachment_descriptions)
-            
-            # Sprawdź, czy konwersacja ma tytuł
-            if len(messages) == 0:
-                conversation_title = get_conversation_title([{"role": "user", "content": user_input}], llm_service, st.session_state["api_key"])
-                db.save_conversation(current_conversation_id, conversation_title)
-            
-            # Wyświetl wiadomość użytkownika
+
+    # Wyświetl istniejące wiadomości
+    for message in messages:
+        role = message["role"]
+        content = format_message_for_display(message)
+
+        if role == "user":
             with st.chat_message("user"):
-                st.markdown(user_input)
-                # Wyświetl załączniki
-                for attachment in attachments_to_send:
-                    if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
-                        img_data = st.session_state["attached_images"][attachment.get("name")]
-                        st.image(img_data, caption=attachment.get("name", "Załącznik"))
+                st.markdown(content)
+                # Wyświetl załączniki jeśli istnieją
+                for attachment in message.get("attachments", []):
+                    if attachment.get("type") == "image" and "data" in attachment:
+                        try:
+                            # Załączniki obrazów są trzymane w sesji, a nie w DB
+                            if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
+                                img_data = st.session_state["attached_images"][attachment.get("name")]
+                                st.image(img_data, caption=attachment.get("name", "Załącznik"))
+                        except Exception as e:
+                            st.error(f"Nie można wyświetlić obrazu: {str(e)}")
                     elif attachment.get("type") == "file" and "text_content" in attachment:
                         st.code(attachment.get("text_content", ""), language="text")
-            
-            # Zapisz wiadomość użytkownika
-            db.save_message(current_conversation_id, "user", user_input, attachments_to_send)
-            
-            # Przygotuj wiadomości dla API
-            api_messages = []
-            for msg in messages:
-                api_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
+
+        elif role == "assistant":
+            with st.chat_message("assistant"):
+                st.markdown(content)
+
+    # Zamknij sekcję wiadomości
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # 2. Sekcja wprowadzania (stała na dole)
+    st.markdown('<div class="input-container">', unsafe_allow_html=True)
+
+    # Kontener na załączniki
+    if "attachments" not in st.session_state:
+        st.session_state["attachments"] = []
+
+    # Zarządzanie załącznikami obrazów w sesji
+    if "attached_images" not in st.session_state:
+        st.session_state["attached_images"] = {}
+
+    # Wyświetl aktualnie dodane załączniki
+    if st.session_state["attachments"]:
+        st.write("Załączniki do wysłania:")
+        cols = st.columns(4)
+        for i, attachment in enumerate(st.session_state["attachments"]):
+            with cols[i % 4]:
+                st.write(f"📎 {attachment.get('name', 'Załącznik')}")
+                if st.button("Usuń", key=f"remove_{i}"):
+                    # Jeśli to obraz, usuń też z pamięci sesji
+                    if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
+                        del st.session_state["attached_images"][attachment.get("name")]
+
+                    st.session_state["attachments"].pop(i)
+                    st.rerun()
+
+    # Dodaj załączniki
+    with st.expander("📎 Dodaj załącznik", expanded=False):
+        attachment_type = st.radio("Typ załącznika", ["Obraz", "Plik tekstowy", "Kod"])
+
+        if attachment_type == "Obraz":
+            uploaded_file = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_upload")
+            if uploaded_file is not None and st.button("Dodaj obraz"):
+                # Zapisujemy obraz w pamięci sesji, a nie w załącznikach
+                image_name = uploaded_file.name
+                st.session_state["attached_images"][image_name] = uploaded_file.getvalue()
+
+                # Do załączników dodajemy tylko referencję
+                st.session_state["attachments"].append({
+                    "type": "image",
+                    "name": image_name
                 })
-            
-            # Dodaj aktualną wiadomość użytkownika
-            api_messages.append({"role": "user", "content": message_content})
-            
-            # Uzyskaj odpowiedź asystenta
-            with st.spinner("Generowanie odpowiedzi..."):
+                st.success(f"Dodano obraz: {image_name}")
+                st.rerun()
+
+        elif attachment_type == "Plik tekstowy":
+            uploaded_file = st.file_uploader("Wybierz plik", type=["txt", "md", "json", "csv"], key="text_upload")
+            if uploaded_file is not None and st.button("Dodaj plik"):
                 try:
-                    model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
-                    system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
-                    temperature = st.session_state.get("temperature", 0.7)
-                    
-                    response = llm_service.call_llm(
-                        messages=api_messages,
-                        model=model,
-                        system_prompt=system_prompt,
-                        temperature=temperature
+                    text_content = uploaded_file.getvalue().decode("utf-8")
+                    st.session_state["attachments"].append({
+                        "type": "file",
+                        "name": uploaded_file.name,
+                        "text_content": text_content
+                    })
+                    st.success(f"Dodano plik: {uploaded_file.name}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Błąd odczytu pliku: {str(e)}")
+
+        elif attachment_type == "Kod":
+            code_language = st.selectbox("Język programowania", ["python", "javascript", "html", "css", "json", "sql", "bash"])
+            code_content = st.text_area("Wklej kod", height=150)
+            file_name = st.text_input("Nazwa pliku (opcjonalnie)", value=f"code.{code_language}")
+
+            if code_content and st.button("Dodaj kod"):
+                st.session_state["attachments"].append({
+                    "type": "file",
+                    "name": file_name,
+                    "text_content": f"
+```{code_language}\n{code_content}\n```"
+                })
+                st.success(f"Dodano kod: {file_name}")
+                st.rerun()
+
+    # Input użytkownika - zawsze na dole
+    user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
+
+    # Zamknij sekcję wprowadzania
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Zamknij główny kontener czatu
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Dodaj JavaScript do automatycznego przewijania do najnowszych wiadomości
+    st.markdown("""
+    <script>
+    // Funkcja do przewijania kontenera wiadomości na dół
+    function scrollMessagesToBottom() {
+        const messagesContainer = document.getElementById('messages-container');
+        if (messagesContainer) {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+    }
+
+    // Wywołaj funkcję po załadowaniu strony
+    window.addEventListener('load', scrollMessagesToBottom);
+
+    // Wywołuj funkcję co 500ms przez 2 sekundy po załadowaniu
+    // (aby obsłużyć opóźnione renderowanie wiadomości)
+    let scrollCount = 0;
+    const scrollInterval = setInterval(() => {
+        scrollMessagesToBottom();
+        scrollCount++;
+        if (scrollCount >= 4) {
+            clearInterval(scrollInterval);
+        }
+    }, 500);
+    </script>
+    """, unsafe_allow_html=True)
+
+    if user_input:
+        # Przygotuj treść wiadomości i załączniki
+        message_content = user_input
+
+        # Kopiujemy załączniki ze stanu sesji
+        attachments_to_send = []
+        for attachment in st.session_state.get("attachments", []):
+            attachment_copy = attachment.copy()
+            attachments_to_send.append(attachment_copy)
+
+        # Dodaj informacje o załącznikach do treści wiadomości
+        if attachments_to_send:
+            attachment_descriptions = []
+            for attachment in attachments_to_send:
+                if attachment.get("type") == "image":
+                    attachment_descriptions.append(f"[Załącznik obrazu: {attachment.get('name', 'image')}]")
+                elif attachment.get("type") == "file" and attachment.get("text_content"):
+                    attachment_descriptions.append(f"[Załącznik pliku: {attachment.get('name', 'file')}]\n{attachment.get('text_content')}")
+
+            if attachment_descriptions:
+                message_content += "\n\n" + "\n\n".join(attachment_descriptions)
+
+        # Sprawdź, czy konwersacja ma tytuł
+        if len(messages) == 0:
+            conversation_title = get_conversation_title([{"role": "user", "content": user_input}], llm_service, st.session_state["api_key"])
+            db.save_conversation(current_conversation_id, conversation_title)
+
+        # Zapisz wiadomość użytkownika
+        db.save_message(current_conversation_id, "user", user_input, attachments_to_send)
+
+        # Przygotuj wiadomości dla API
+        api_messages = []
+        for msg in messages:
+            api_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+
+        # Dodaj aktualną wiadomość użytkownika
+        api_messages.append({"role": "user", "content": message_content})
+
+        # Uzyskaj odpowiedź asystenta
+        with st.spinner("Generowanie odpowiedzi..."):
+            try:
+                model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
+                system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
+                temperature = st.session_state.get("temperature", 0.7)
+
+                response = llm_service.call_llm(
+                    messages=api_messages,
+                    model=model,
+                    system_prompt=system_prompt,
+                    temperature=temperature
+                )
+
+                assistant_response = response["choices"][0]["message"]["content"]
+
+                # Aktualizuj statystyki tokenów
+                if "usage" in response:
+                    usage = response["usage"]
+                    st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
+                    st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+
+                    # Oblicz koszt
+                    cost = calculate_cost(
+                        model, 
+                        usage["prompt_tokens"], 
+                        usage["completion_tokens"]
                     )
-                    
-                    assistant_response = response["choices"][0]["message"]["content"]
-                    
-                    # Aktualizuj statystyki tokenów
-                    if "usage" in response:
-                        usage = response["usage"]
-                        st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
-                        st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
-                        
-                        # Oblicz koszt
-                        cost = calculate_cost(
-                            model, 
-                            usage["prompt_tokens"], 
-                            usage["completion_tokens"]
-                        )
-                        
-                        st.session_state["token_usage"]["cost"] += cost
-                    
-                    # Wyświetl odpowiedź asystenta
-                    with st.chat_message("assistant"):
-                        st.markdown(assistant_response)
-                    
-                    # Zapisz odpowiedź asystenta
-                    db.save_message(current_conversation_id, "assistant", assistant_response)
-                    
+
+                    st.session_state["token_usage"]["cost"] += cost
+
+                # Zapisz odpowiedź asystenta
+                db.save_message(current_conversation_id, "assistant", assistant_response)
+
+                # Wyczyść załączniki
                     # Wyczyść załączniki po wysłaniu
                     st.session_state["attachments"] = []
                     
