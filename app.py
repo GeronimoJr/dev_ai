@@ -8,10 +8,9 @@ import uuid
 import sqlite3
 from datetime import datetime
 import tiktoken
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Generator
 import hashlib
 from functools import wraps
-import base64
 import io
 import traceback
 
@@ -33,7 +32,7 @@ MODEL_OPTIONS = [
         "id": "openai/gpt-4o:floor",
         "name": "GPT-4o",
         "pricing": {"prompt": 2.5, "completion": 10.0},
-        "description": "Silna alternatywa z dobrymi zdolnościami kodowania i analizy obrazów"
+        "description": "Silna alternatywa z dobrymi zdolnościami kodowania"
     },
     {
         "id": "openai/gpt-4-turbo:floor",
@@ -431,44 +430,35 @@ def process_attachments(attachments):
         att_name = attachment.get("name", "")
         
         if att_type == "file" and "text_content" in attachment:
-            processed_content += f"\n\n[ZAŁĄCZNIK: {att_name}]\n{attachment['text_content']}\n"
-        elif att_type == "image":
-            processed_content += f"\n\n[OBRAZ: {att_name}]\n"
+            # Sprawdź, czy zawartość to blok kodu
+            if attachment['text_content'].startswith("```") and attachment['text_content'].endswith("```"):
+                processed_content += f"\n\n[KOD: {att_name}]\n{attachment['text_content']}\n"
+            else:
+                processed_content += f"\n\n[PLIK: {att_name}]\n{attachment['text_content']}\n"
     
     return processed_content.strip()
 
-def extract_image_content(image_file):
-    """Konwertuje obraz na base64 dla modeli wspierających obrazy (np. GPT-4o)"""
-    try:
-        # Pobierz dane obrazu
-        image_data = image_file.getvalue()
-        
-        # Konwertuj na base64
-        base64_image = base64.b64encode(image_data).decode('utf-8')
-        
-        # Określ typ MIME na podstawie rozszerzenia pliku
-        mime_type = "image/jpeg"  # domyślny typ
-        if isinstance(image_file, io.BytesIO):
-            # Obsługa dla BytesIO
-            mime_type = "image/jpeg"  # Domyślnie zakładamy JPEG
-        else:
-            # Obsługa dla plików z nazwą
-            try:
-                file_name = image_file.name.lower()
-                if file_name.endswith('.png'):
-                    mime_type = "image/png"
-                elif file_name.endswith(('.jpg', '.jpeg')):
-                    mime_type = "image/jpeg"
-            except:
-                pass
-        
-        return {
-            "base64_data": base64_image,
-            "mime_type": mime_type
-        }
-    except Exception as e:
-        print(f"Błąd podczas przetwarzania obrazu: {str(e)}")
-        return None
+def display_code_block(code, language="python"):
+    """Wyświetla blok kodu z opcjami kopiowania i pobrania"""
+    st.code(code, language=language)
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("Kopiuj kod", key=f"copy_{hash(code)}", use_container_width=True):
+            st.code(code)
+            st.info("Skopiuj powyższy kod")
+    
+    with col2:
+        # Generuj plik do pobrania
+        if st.button("Pobierz plik", key=f"download_{hash(code)}", use_container_width=True):
+            filename = f"code_{language}.{language}"
+            st.download_button(
+                label="Pobierz", 
+                data=code, 
+                file_name=filename,
+                mime="text/plain",
+                key=f"dl_{hash(code)}"
+            )
 
 # === Serwis LLM ===
 class LLMService:
@@ -504,7 +494,7 @@ class LLMService:
                 temperature: float = 0.7, 
                 max_tokens: int = 12000,
                 use_cache: bool = True) -> Dict[str, Any]:
-        """Wywołaj API LLM przez OpenRouter z obsługą obrazów i załączników"""
+        """Wywołaj API LLM przez OpenRouter"""
         # Sprawdź pamięć podręczną, jeśli używamy cachowania
         if use_cache and temperature < 0.1:  # Cachujemy tylko deterministyczne odpowiedzi
             cache_key = self.get_cache_key(messages, model, system_prompt, temperature)
@@ -516,43 +506,15 @@ class LLMService:
         if system_prompt:
             api_messages.append({"role": "system", "content": system_prompt})
         
-        # Przeanalizuj każdą wiadomość, szukając obrazów do konwersji
+        # Dodaj wszystkie wiadomości
         for msg in messages:
-            message_content = msg.get("content", "")
-            attachments = msg.get("attachments", [])
-            
-            # Obsługa obrazów dla modeli, które je wspierają (jak GPT-4o)
-            if msg.get("role") == "user" and "attachments" in msg and any(att.get("type") == "image" for att in attachments):
-                # Przygotuj format dla obrazów, jeśli używamy modeli obsługujących obrazy
-                if model in ["openai/gpt-4o:floor", "openai/gpt-4-vision"]:
-                    content_parts = [{"type": "text", "text": message_content}]
-                    
-                    for attachment in attachments:
-                        if attachment.get("type") == "image" and attachment.get("image_data"):
-                            content_parts.append({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{attachment.get('mime_type', 'image/jpeg')};base64,{attachment['image_data']['base64_data']}",
-                                }
-                            })
-                    
-                    api_messages.append({"role": msg["role"], "content": content_parts})
-                else:
-                    # Dla modeli bez wsparcia obrazów, dodaj tylko tekst z opisem załączników
-                    api_messages.append({"role": msg["role"], "content": message_content})
-            else:
-                # Zwykła wiadomość tekstowa
-                api_messages.append({"role": msg["role"], "content": message_content})
+            api_messages.append({"role": msg["role"], "content": msg["content"]})
         
         # Oblicz tokeny promptu
         prompt_text = system_prompt or ""
         for msg in messages:
             if isinstance(msg.get("content"), str):
                 prompt_text += msg["content"]
-            elif isinstance(msg.get("content"), list):  # Dla wiadomości multimodalnych (GPT-4o)
-                for part in msg["content"]:
-                    if part.get("type") == "text":
-                        prompt_text += part.get("text", "")
         
         prompt_tokens = self.count_tokens(prompt_text)
         
@@ -577,7 +539,7 @@ class LLMService:
                         "Content-Type": "application/json"
                     },
                     json=api_payload,
-                    timeout=300  # Zwiększenie timeout do 3 minut
+                    timeout=300  # Zwiększenie timeout do 5 minut
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -606,6 +568,83 @@ class LLMService:
                 
                 # Czekaj przed ponowieniem
                 time.sleep(retry_delay * (2 ** attempt))  # Wykładnicze wycofanie
+    
+    def call_llm_streaming(self, 
+                         messages: List[Dict[str, Any]], 
+                         model: str = "anthropic/claude-3.7-sonnet:floor", 
+                         system_prompt: str = None, 
+                         temperature: float = 0.7, 
+                         max_tokens: int = 12000) -> Generator[str, None, None]:
+        """Wywołaj API LLM przez OpenRouter ze streamingiem odpowiedzi"""
+        
+        # Przygotuj wiadomości z promptem systemowym, jeśli podano
+        api_messages = []
+        if system_prompt:
+            api_messages.append({"role": "system", "content": system_prompt})
+        
+        # Dodaj wszystkie wiadomości
+        for msg in messages:
+            api_messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # Oblicz tokeny promptu
+        prompt_text = system_prompt or ""
+        for msg in messages:
+            if isinstance(msg.get("content"), str):
+                prompt_text += msg["content"]
+        
+        prompt_tokens = self.count_tokens(prompt_text)
+        
+        api_payload = {
+            "model": model,
+            "messages": api_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True
+        }
+        
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            },
+            json=api_payload,
+            stream=True,
+            timeout=300  # Zwiększenie timeout do 5 minut
+        )
+        
+        # Przygotuj zmienne do śledzenia odpowiedzi
+        full_response = ""
+        completion_tokens = 0
+        
+        for line in response.iter_lines():
+            if line:
+                line = line.decode('utf-8')
+                if line.startswith('data:'):
+                    if line.strip() == 'data: [DONE]':
+                        break
+                    
+                    try:
+                        data = json.loads(line[5:])
+                        if "choices" in data and len(data["choices"]) > 0:
+                            delta = data["choices"][0].get("delta", {})
+                            if "content" in delta:
+                                content_chunk = delta["content"]
+                                full_response += content_chunk
+                                completion_tokens += self.count_tokens(content_chunk)
+                                yield content_chunk
+                    except json.JSONDecodeError:
+                        pass
+        
+        # Dodajemy metadane na końcu, aby mogły zostać wykorzystane przez wywołujący kod
+        yield {
+            "full_response": full_response,
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        }
 
 # === Funkcje pomocnicze ===
 def calculate_cost(model_id: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -662,6 +701,19 @@ def get_conversation_title(messages: List[Dict[str, str]], llm_service: LLMServi
     
     # Domyślnie użyj skróconej wiadomości użytkownika
     return user_message[:40] + ("..." if len(user_message) > 40 else "")
+
+def parse_code_blocks(content):
+    """Wyodrębnij bloki kodu z treści markdown"""
+    code_blocks = []
+    pattern = r"```([a-zA-Z0-9]*)\n(.*?)\n```"
+    matches = re.findall(pattern, content, re.DOTALL)
+    
+    for lang, code in matches:
+        # Standardowy język, jeśli nie został określony
+        language = lang.strip() if lang.strip() else "python"
+        code_blocks.append({"language": language, "code": code})
+    
+    return code_blocks
 
 # === Komponenty interfejsu użytkownika ===
 def sidebar_component():
@@ -740,7 +792,6 @@ def sidebar_component():
             st.session_state["current_conversation_id"] = str(uuid.uuid4())
             # Wyczyść załączniki dla nowej konwersacji
             st.session_state["attachments"] = []
-            st.session_state["attached_images"] = {}
             st.rerun()
 
 @requires_auth
@@ -824,9 +875,6 @@ def chat_component():
     if "attachments" not in st.session_state:
         st.session_state["attachments"] = []
 
-    if "attached_images" not in st.session_state:
-        st.session_state["attached_images"] = {}
-
     # Pobierz wiadomości
     messages = db.get_messages(current_conversation_id)
     
@@ -838,20 +886,25 @@ def chat_component():
         if role == "user":
             with st.chat_message("user"):
                 st.markdown(content)
-                # Wyświetl załączniki jeśli istnieją - tylko obrazy
-                for attachment in message.get("attachments", []):
-                    if attachment.get("type") == "image":
-                        try:
-                            # Załączniki obrazów są trzymane w sesji, a nie w DB
-                            if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
-                                img_data = st.session_state["attached_images"][attachment.get("name")]
-                                st.image(img_data, caption=attachment.get("name", "Załącznik"))
-                        except Exception as e:
-                            st.warning(f"Nie można wyświetlić obrazu: {attachment.get('name')}")
-
         elif role == "assistant":
             with st.chat_message("assistant"):
-                st.markdown(content)
+                # Sprawdź, czy odpowiedź zawiera bloki kodu do wyświetlenia
+                code_blocks = parse_code_blocks(content)
+                
+                # Wyświetl treść ogólną (bez bloków kodu, które będą wyświetlane oddzielnie)
+                clean_content = content
+                for match in re.finditer(r"```.*?```", content, re.DOTALL):
+                    start, end = match.span()
+                    clean_content = clean_content.replace(match.group(), f"[BLOK KODU #{match.start()}]")
+                
+                st.markdown(clean_content)
+                
+                # Wyświetl każdy blok kodu z dodatkowymi kontrolkami
+                if code_blocks:
+                    st.write("### Bloki kodu:")
+                    for i, block in enumerate(code_blocks):
+                        with st.expander(f"Kod {i+1} - {block['language']}", expanded=True):
+                            display_code_block(block['code'], block['language'])
 
     # Wyświetlanie załączników (jako tekst pod polem wejściowym)
     if st.session_state["attachments"]:
@@ -861,20 +914,15 @@ def chat_component():
         ])
         st.markdown(f"<div style='margin-bottom: 5px'>{attachment_text}</div>", unsafe_allow_html=True)
     
-    # Obsługa załączników - tylko ikony pod polem czatu
-    col1, col2, col3 = st.columns([1, 1, 1])
+    # Obsługa załączników - ikony pod polem czatu
+    col1, col2 = st.columns([1, 1])
     
     with col1:
-        if st.button("📷 Obraz", use_container_width=True):
-            st.session_state["show_image_uploader"] = not st.session_state.get("show_image_uploader", False)
-            st.rerun()
-    
-    with col2:
         if st.button("📄 Plik", use_container_width=True):
             st.session_state["show_file_uploader"] = not st.session_state.get("show_file_uploader", False)
             st.rerun()
     
-    with col3:
+    with col2:
         if st.button("💻 Kod", use_container_width=True):
             st.session_state["show_code_input"] = not st.session_state.get("show_code_input", False)
             st.rerun()
@@ -885,35 +933,13 @@ def chat_component():
         for i, (col, attachment) in enumerate(zip(cols, st.session_state["attachments"])):
             with col:
                 if st.button(f"❌ {attachment.get('name', '')[:7]}...", key=f"del_{i}"):
-                    if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
-                        del st.session_state["attached_images"][attachment.get("name")]
                     st.session_state["attachments"].pop(i)
                     st.rerun()
 
     # Formularze załączników
-    if st.session_state.get("show_image_uploader", False):
-        with st.expander("Dodaj obraz", expanded=True):
-            uploaded_file = st.file_uploader("Wybierz obraz", type=["png", "jpg", "jpeg"], key="image_upload")
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                if st.button("Anuluj", use_container_width=True):
-                    st.session_state["show_image_uploader"] = False
-                    st.rerun()
-            with col2:
-                if uploaded_file is not None and st.button("Dodaj", use_container_width=True):
-                    image_name = uploaded_file.name
-                    st.session_state["attached_images"][image_name] = uploaded_file.getvalue()
-                    st.session_state["attachments"].append({
-                        "type": "image",
-                        "name": image_name
-                    })
-                    st.session_state["show_image_uploader"] = False
-                    st.success(f"Dodano obraz: {image_name}")
-                    st.rerun()
-
     if st.session_state.get("show_file_uploader", False):
         with st.expander("Dodaj plik tekstowy", expanded=True):
-            uploaded_file = st.file_uploader("Wybierz plik", type=["txt", "md", "json", "csv"], key="text_upload")
+            uploaded_file = st.file_uploader("Wybierz plik", type=["txt", "md", "json", "csv", "py", "js", "html", "css"], key="text_upload")
             col1, col2 = st.columns([1, 1])
             with col1:
                 if st.button("Anuluj", use_container_width=True):
@@ -968,32 +994,12 @@ def chat_component():
         # Natychmiast wyświetl wiadomość użytkownika
         with st.chat_message("user"):
             st.markdown(user_input)
-            # Pokaż załączniki obrazów
-            for attachment in st.session_state.get("attachments", []):
-                if attachment.get("type") == "image":
-                    try:
-                        if "attached_images" in st.session_state and attachment.get("name") in st.session_state["attached_images"]:
-                            img_data = st.session_state["attached_images"][attachment.get("name")]
-                            st.image(img_data, caption=attachment.get("name", "Załącznik"))
-                    except Exception as e:
-                        st.error(f"Błąd wyświetlania obrazu: {str(e)}")
         
         # Przygotuj treść wiadomości i załączniki
         message_content = user_input
         
         # Przetwórz załączniki
-        attachments_to_send = []
-        for attachment in st.session_state.get("attachments", []):
-            attachment_copy = attachment.copy()
-            
-            # Dodaj dane obrazu dla modeli obsługujących obrazy
-            if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
-                img_data = st.session_state["attached_images"][attachment.get("name")]
-                image_content = extract_image_content(io.BytesIO(img_data))
-                if image_content:
-                    attachment_copy["image_data"] = image_content
-                    
-            attachments_to_send.append(attachment_copy)
+        attachments_to_send = st.session_state.get("attachments", []).copy()
         
         # Dodaj informacje o załącznikach do treści wiadomości
         attachments_text = process_attachments(attachments_to_send)
@@ -1013,64 +1019,81 @@ def chat_component():
         
         # Wyświetl oczekującą odpowiedź asystenta
         with st.chat_message("assistant"):
-            with st.spinner("Generowanie odpowiedzi..."):
-                try:
-                    model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
-                    system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
-                    temperature = st.session_state.get("temperature", 0.7)
+            response_placeholder = st.empty()
+            full_response = ""
+            
+            try:
+                model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
+                system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
+                temperature = st.session_state.get("temperature", 0.7)
+                
+                # Użyj funkcji optymalizującej kontekst
+                optimized_messages = prepare_messages_with_token_management(
+                    all_messages, 
+                    system_prompt, 
+                    model, 
+                    llm_service
+                )
+                
+                # Wywołaj API ze streamingiem
+                metadata = None
+                for chunk in llm_service.call_llm_streaming(
+                    messages=optimized_messages,
+                    model=model,
+                    system_prompt=None,  # System prompt jest już dodany w optimized_messages
+                    temperature=temperature,
+                    max_tokens=12000
+                ):
+                    # Sprawdź, czy to ostatni element z metadanymi
+                    if isinstance(chunk, dict) and "full_response" in chunk:
+                        metadata = chunk
+                        break
                     
-                    # Użyj funkcji optymalizującej kontekst
-                    optimized_messages = prepare_messages_with_token_management(
-                        all_messages, 
-                        system_prompt, 
+                    # Aktualizuj odpowiedź w czasie rzeczywistym
+                    full_response += chunk
+                    response_placeholder.markdown(full_response + "▌")
+                
+                # Finalne wyświetlenie odpowiedzi bez kursora
+                response_placeholder.markdown(full_response)
+                
+                # Aktualizuj statystyki tokenów, jeśli mamy metadane
+                if metadata and "usage" in metadata:
+                    usage = metadata["usage"]
+                    st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
+                    st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+                    
+                    # Oblicz koszt
+                    cost = calculate_cost(
                         model, 
-                        llm_service
+                        usage["prompt_tokens"], 
+                        usage["completion_tokens"]
                     )
                     
-                    response = llm_service.call_llm(
-                        messages=optimized_messages,
-                        model=model,
-                        system_prompt=None,  # System prompt jest już dodany w optimized_messages
-                        temperature=temperature,
-                        max_tokens=12000
-                    )
-                    
-                    assistant_response = response["choices"][0]["message"]["content"]
-                    
-                    # Aktualizuj statystyki tokenów
-                    if "usage" in response:
-                        usage = response["usage"]
-                        st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
-                        st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
-                        
-                        # Oblicz koszt
-                        cost = calculate_cost(
-                            model, 
-                            usage["prompt_tokens"], 
-                            usage["completion_tokens"]
-                        )
-                        
-                        st.session_state["token_usage"]["cost"] += cost
-                    
-                    # Zapisz odpowiedź asystenta
-                    db.save_message(current_conversation_id, "assistant", assistant_response)
-                    
-                    # Wyświetl odpowiedź
-                    st.markdown(assistant_response)
-                    
-                    # Wyczyść załączniki po wysłaniu
-                    st.session_state["attachments"] = []
-                    # Ukryj formularze załączników
-                    st.session_state["show_image_uploader"] = False
-                    st.session_state["show_file_uploader"] = False  
-                    st.session_state["show_code_input"] = False
-                    
-                    # Odśwież stronę aby wyświetlić nową wiadomość bez spinnerów
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Wystąpił błąd: {str(e)}")
-                    st.code(traceback.format_exc())
+                    st.session_state["token_usage"]["cost"] += cost
+                
+                # Wyświetl bloki kodu oddzielnie, jeśli istnieją
+                code_blocks = parse_code_blocks(full_response)
+                if code_blocks:
+                    st.write("### Bloki kodu:")
+                    for i, block in enumerate(code_blocks):
+                        with st.expander(f"Kod {i+1} - {block['language']}", expanded=True):
+                            display_code_block(block['code'], block['language'])
+                
+                # Zapisz odpowiedź asystenta
+                db.save_message(current_conversation_id, "assistant", full_response)
+                
+                # Wyczyść załączniki po wysłaniu
+                st.session_state["attachments"] = []
+                # Ukryj formularze załączników
+                st.session_state["show_file_uploader"] = False  
+                st.session_state["show_code_input"] = False
+                
+                # Odśwież stronę aby wyświetlić nową wiadomość bez spinnerów
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"Wystąpił błąd: {str(e)}")
+                st.code(traceback.format_exc())
 
 # === Główna aplikacja ===
 def main():
