@@ -59,19 +59,14 @@ def requires_auth(f):
 
 def login_page():
     st.title("🔒 Logowanie")
-
     col1, col2, col3 = st.columns([1, 2, 1])
-
     with col2:
         st.markdown("### Zaloguj się, aby uzyskać dostęp")
-
         username = st.text_input("Nazwa użytkownika", key="login_username")
         password = st.text_input("Hasło", type="password", key="login_password")
-
         if st.button("Zaloguj"):
             correct_username = st.secrets.get("APP_USER", "admin")
             correct_password = st.secrets.get("APP_PASSWORD", "password")
-
             if username == correct_username and password == correct_password:
                 st.session_state["authenticated"] = True
                 st.success("Zalogowano pomyślnie!")
@@ -79,14 +74,25 @@ def login_page():
             else:
                 st.error("Nieprawidłowa nazwa użytkownika lub hasło!")
 
+def sanitize_code_block_markers(text):
+    if not text or "```" not in text:
+        return text
+    text = re.sub(r'\n\s*```', '\n```', text)
+    text = re.sub(r'```\s*\n', '```\n', text)
+    text = re.sub(r'```python\npython', '```python\n', text)
+    text = re.sub(r'python\n```', '\n```', text)
+    return text
+
 class AssistantDB:
     def __init__(self, db_path='streamlit_assistant.db'):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
+        self.message_cache = {}
 
     def _create_tables(self):
         cursor = self.conn.cursor()
-
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -95,7 +101,6 @@ class AssistantDB:
             updated_at TIMESTAMP
         )
         ''')
-
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -106,42 +111,41 @@ class AssistantDB:
             FOREIGN KEY (conversation_id) REFERENCES conversations (id)
         )
         ''')
-
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)')
-
         self.conn.commit()
 
     def save_message(self, conversation_id: str, role: str, content: str) -> str:
         cursor = self.conn.cursor()
         message_id = str(uuid.uuid4())
-
         cursor.execute(
             "INSERT INTO messages (id, conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
             (message_id, conversation_id, role, content, datetime.now())
         )
         self.conn.commit()
+        self.message_cache = {}
         return message_id
 
-    def get_messages(self, conversation_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    @lru_cache(maxsize=10)
+    def get_cached_messages(self, conversation_id, limit=None):
         cursor = self.conn.cursor()
-
         query = "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp"
         params = [conversation_id]
-
         if limit:
             query += " LIMIT ?"
             params.append(limit)
-
         cursor.execute(query, params)
-
         messages = []
         for role, content in cursor.fetchall():
-            messages.append({
-                "role": role,
-                "content": content
-            })
+            messages.append({"role": role, "content": content})
+        return messages
 
+    def get_messages(self, conversation_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        cache_key = f"{conversation_id}:{limit}"
+        if cache_key in self.message_cache:
+            return self.message_cache[cache_key]
+        messages = self.get_cached_messages(conversation_id, limit)
+        self.message_cache[cache_key] = messages
         return messages
 
     def get_last_messages(self, conversation_id: str, count: int = 10) -> List[Dict[str, Any]]:
@@ -150,14 +154,9 @@ class AssistantDB:
             "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?",
             (conversation_id, count)
         )
-
         messages = []
         for role, content in cursor.fetchall():
-            messages.append({
-                "role": role,
-                "content": content
-            })
-
+            messages.append({"role": role, "content": content})
         return messages[::-1]
 
     def get_message_count(self, conversation_id: str) -> int:
@@ -171,7 +170,6 @@ class AssistantDB:
     def save_conversation(self, conversation_id: str, title: str):
         cursor = self.conn.cursor()
         now = datetime.now()
-
         cursor.execute("SELECT id FROM conversations WHERE id = ?", (conversation_id,))
         if cursor.fetchone():
             cursor.execute(
@@ -183,7 +181,6 @@ class AssistantDB:
                 "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
                 (conversation_id, title, now, now)
             )
-
         self.conn.commit()
 
     def get_conversations(self) -> List[Dict[str, Any]]:
@@ -201,6 +198,7 @@ class AssistantDB:
         cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         self.conn.commit()
+        self.message_cache = {}
 
 class LLMService:
     def __init__(self, api_key: str):
@@ -210,7 +208,6 @@ class LLMService:
             self.gpt4_encoding = tiktoken.encoding_for_model("gpt-4")
         except:
             self.gpt4_encoding = None
-
         try:
             self.claude_encoding = tiktoken.get_encoding("cl100k_base")
         except:
@@ -219,7 +216,8 @@ class LLMService:
     def count_tokens(self, text: str) -> int:
         if not text:
             return 0
-
+        if len(text) < 100:
+            return len(text) // 4
         try:
             if self.gpt4_encoding:
                 return len(self.gpt4_encoding.encode(text))
@@ -234,7 +232,7 @@ class LLMService:
         cache_input = f"{json.dumps(messages)}-{model}-{system_prompt}-{temperature}"
         return hashlib.md5(cache_input.encode()).hexdigest()
 
-    @lru_cache(maxsize=100)
+    @lru_cache(maxsize=200)
     def get_cached_response(self, cache_key):
         return self.cache.get(cache_key)
 
@@ -307,7 +305,6 @@ class LLMService:
             except requests.exceptions.RequestException as e:
                 if attempt == max_retries - 1:  
                     raise Exception(f"Nie udało się połączyć z API po {max_retries} próbach: {str(e)}")
-
                 time.sleep(retry_delay * (2 ** attempt))  
 
     def call_llm_streaming(self, 
@@ -381,6 +378,8 @@ class LLMService:
                 buffer = ""
                 chunk_collection = []
                 last_update_time = time.time()
+                buffer_size = 20
+                update_interval = 0.5
 
                 for line in response.iter_lines():
                     if line:
@@ -399,7 +398,7 @@ class LLMService:
 
                                         buffer += content_chunk
 
-                                        update_buffer = len(chunk_collection) % 100 == 0 or "```" in buffer
+                                        update_buffer = len(chunk_collection) % buffer_size == 0 or "```" in buffer
 
                                         if update_buffer:
                                             if "```" in buffer and not in_code_block:
@@ -448,7 +447,7 @@ class LLMService:
                                                 buffer = ""
 
                                         current_time = time.time()
-                                        should_update = len(full_response) % 1000 == 0 or (current_time - last_update_time) > 2.0
+                                        should_update = len(full_response) % 2000 == 0 or (current_time - last_update_time) > update_interval
 
                                         if should_update:
                                             st.session_state["current_stream_response"] = full_response
@@ -515,6 +514,10 @@ def prepare_messages_with_token_management(messages, system_prompt, model_id, ll
     if not messages:
         return []
 
+    @lru_cache(maxsize=100)
+    def cached_count_tokens(text):
+        return llm_service.count_tokens(text)
+
     api_messages = []
     if system_prompt:
         api_messages.append({"role": "system", "content": system_prompt})
@@ -536,9 +539,9 @@ def prepare_messages_with_token_management(messages, system_prompt, model_id, ll
 
     first_msg = messages[0] if messages else None
 
-    last_user_tokens = llm_service.count_tokens(last_user_msg["content"]) if last_user_msg else 0
-    last_assistant_tokens = llm_service.count_tokens(last_assistant_msg["content"]) if last_assistant_msg else 0
-    first_msg_tokens = llm_service.count_tokens(first_msg["content"]) if first_msg else 0
+    last_user_tokens = cached_count_tokens(last_user_msg["content"]) if last_user_msg else 0
+    last_assistant_tokens = cached_count_tokens(last_assistant_msg["content"]) if last_assistant_msg else 0
+    first_msg_tokens = cached_count_tokens(first_msg["content"]) if first_msg else 0
 
     important_tokens = last_user_tokens + last_assistant_tokens + first_msg_tokens
 
@@ -561,7 +564,7 @@ def prepare_messages_with_token_management(messages, system_prompt, model_id, ll
                               if msg != first_msg and msg != last_assistant_msg and msg != last_user_msg]
 
         for msg in remaining_messages:
-            msg_tokens = llm_service.count_tokens(msg["content"])
+            msg_tokens = cached_count_tokens(msg["content"])
 
             if current_tokens + msg_tokens <= max_input_tokens - max_completion_tokens - 100:
                 api_messages.append(msg)
@@ -580,6 +583,15 @@ def prepare_messages_with_token_management(messages, system_prompt, model_id, ll
 
     return api_messages
 
+def format_code_with_black(code, line_length=88, timeout=1):
+    if len(code.splitlines()) > 500 or len(code) < 50:
+        return code
+    try:
+        mode = black.Mode(line_length=line_length)
+        return black.format_str(code, mode=mode)
+    except Exception:
+        return code
+
 def process_code_blocks(content, optimize_code=True):
     if "```" not in content:
         return content
@@ -590,17 +602,16 @@ def process_code_blocks(content, optimize_code=True):
         lang = match.group(1) or "python"
         code = match.group(2)
 
-        if lang == "python" and optimize_code:
-            code_length = len(code.splitlines())
-            if 10 < code_length < 500:
-                try:
-                    code = format_code_with_black(code)
-                except Exception:
-                    pass
+        if lang == "python" and optimize_code and 10 < len(code.splitlines()) < 300:
+            try:
+                code = format_code_with_black(code)
+            except Exception:
+                pass
 
         return f"```{lang}\n{code}\n```"
 
-    return code_block_pattern.sub(replace_block, content)
+    processed = code_block_pattern.sub(replace_block, content)
+    return sanitize_code_block_markers(processed)
 
 def format_message_for_display(message):
     content = message.get("content", "")
@@ -645,16 +656,6 @@ def parse_code_blocks(content):
         code_blocks.append({"language": language, "code": code})
 
     return code_blocks
-
-def format_code_with_black(code, line_length=88, timeout=2):
-    try:
-        if len(code.splitlines()) > 1000:
-            return code
-
-        mode = black.Mode(line_length=line_length)
-        return black.format_str(code, mode=mode)
-    except Exception:
-        return code
 
 def sidebar_component():
     st.sidebar.title("AI Asystent Developera")
@@ -748,7 +749,7 @@ def process_streaming_update():
     code_blocks = st.session_state.get("code_blocks", {})
 
     if "[CODE_BLOCK_" not in full_response:
-        return full_response
+        return sanitize_code_block_markers(full_response)
 
     display_response = full_response
     for block_id, block_data in code_blocks.items():
@@ -760,21 +761,27 @@ def process_streaming_update():
                 preview_code = "\n".join(preview_lines) + "\n... [długi blok kodu - zostanie wyświetlony w pełni po zakończeniu]"
                 display_response = display_response.replace(marker, f"```{block_data['lang']}\n{preview_code}\n```")
             else:
+                if block_data['lang'] == "python" and st.session_state.get("optimize_code", True) and len(code.splitlines()) < 300:
+                    try:
+                        code = format_code_with_black(code)
+                    except:
+                        pass
                 display_response = display_response.replace(marker, f"```{block_data['lang']}\n{code}\n```")
 
-    return display_response
+    return sanitize_code_block_markers(display_response)
 
 def process_partial_response(response, code_blocks, optimize_code):
+    if "[CODE_BLOCK_" not in response:
+        return sanitize_code_block_markers(response)
+
     processed_response = response
-
-    if "[CODE_BLOCK_" not in processed_response:
-        return processed_response
-
     for block_id, block_data in code_blocks.items():
         marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
-        code = block_data["code"]
+        if marker not in processed_response:
+            continue
 
-        if block_data['lang'] == "python" and optimize_code and 10 < len(code.splitlines()) < 500:
+        code = block_data["code"]
+        if block_data['lang'] == "python" and optimize_code and 10 < len(code.splitlines()) < 300:
             try:
                 code = format_code_with_black(code)
             except:
@@ -782,7 +789,7 @@ def process_partial_response(response, code_blocks, optimize_code):
 
         processed_response = processed_response.replace(marker, f"```{block_data['lang']}\n{code}\n```")
 
-    return processed_response
+    return sanitize_code_block_markers(processed_response)
 
 @requires_auth
 def chat_component():
@@ -791,7 +798,6 @@ def chat_component():
     .main .block-container {
         padding-bottom: 80px;
     }
-
     .stChatInputContainer {
         position: fixed;
         bottom: 0;
@@ -802,15 +808,12 @@ def chat_component():
         z-index: 999;
         border-top: 1px solid #ddd;
     }
-
     .stMarkdown pre {
         overflow-x: auto;
     }
-
     .element-container .stMarkdown {
         min-height: 20px;
     }
-
     @media (max-width: 768px) {
         .stChatInputContainer {
             left: 0;
@@ -873,7 +876,7 @@ def chat_component():
                         lang = block["language"]
                         code = block["code"]
 
-                        if lang == "python" and st.session_state.get("optimize_code", True) and 10 < len(code.splitlines()) < 500:
+                        if lang == "python" and st.session_state.get("optimize_code", True) and 10 < len(code.splitlines()) < 300:
                             try:
                                 code = format_code_with_black(code)
                             except:
@@ -891,7 +894,7 @@ def chat_component():
                             code = code_blocks_in_message[block_id]["code"]
                             processed_content = processed_content.replace(code_marker, f"```{lang}\n{code}\n```")
 
-                    st.markdown(processed_content)
+                    st.markdown(sanitize_code_block_markers(processed_content))
 
     if "current_stream_response" in st.session_state and st.session_state["current_stream_response"]:
         if st.session_state.get("stream_was_interrupted", False):
@@ -900,25 +903,14 @@ def chat_component():
 
                 partial_response = st.session_state["current_stream_response"]
                 code_blocks = st.session_state.get("code_blocks", {})
+                processed_response = process_partial_response(partial_response, code_blocks, st.session_state.get("optimize_code", True))
 
-                for block_id, block_data in code_blocks.items():
-                    marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
-                    code = block_data["code"]
-
-                    if block_data['lang'] == "python" and st.session_state.get("optimize_code", True) and 10 < len(code.splitlines()) < 500:
-                        try:
-                            code = format_code_with_black(code)
-                        except:
-                            pass
-
-                    partial_response = partial_response.replace(marker, f"```{block_data['lang']}\n{code}\n```")
-
-                st.markdown(partial_response)
+                st.markdown(processed_response)
 
                 save_partial_container = st.empty()
 
                 if save_partial_container.button("Zapisz tę częściową odpowiedź"):
-                    db.save_message(current_conversation_id, "assistant", partial_response)
+                    db.save_message(current_conversation_id, "assistant", processed_response)
                     st.session_state["current_stream_response"] = ""
                     st.session_state["code_blocks"] = {}
                     st.session_state["stream_was_interrupted"] = False
@@ -1002,7 +994,6 @@ def chat_component():
 
                         if not isinstance(chunk, dict):
                             display_response = process_streaming_update()
-
                             response_placeholder.markdown(display_response + "▌")
 
                 except Exception as e:
@@ -1016,7 +1007,6 @@ def chat_component():
                     code_blocks = metadata.get("code_blocks", {})
 
                 processed_response = process_partial_response(full_response, code_blocks, optimize_code)
-
                 response_placeholder.markdown(processed_response)
 
                 if metadata and "usage" in metadata:
@@ -1033,23 +1023,18 @@ def chat_component():
                     st.session_state["token_usage"]["cost"] += cost
 
                 db.save_message(current_conversation_id, "assistant", processed_response)
-
                 st.session_state["current_stream_response"] = ""
                 st.session_state["code_blocks"] = {}
-
                 st.rerun()
 
             except Exception as e:
                 st.session_state["stream_was_interrupted"] = True
-
                 st.error(f"Wystąpił błąd: {str(e)}")
                 st.code(traceback.format_exc())
 
                 if full_response:
                     st.warning("Częściowa odpowiedź przed wystąpieniem błędu:")
-
                     processed_response = process_partial_response(full_response, code_blocks, optimize_code)
-
                     st.markdown(processed_response)
                     st.session_state["current_stream_response"] = full_response
 
@@ -1083,7 +1068,6 @@ def main():
         st.session_state["api_key"] = api_key
 
     sidebar_component()
-
     chat_component()
 
 if __name__ == "__main__":
