@@ -178,240 +178,6 @@ class AssistantDB:
         cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         self.conn.commit()
 
-def prepare_messages_with_token_management(messages, system_prompt, model_id, llm_service):
-    model_token_limits = {
-        "anthropic/claude-3.7-sonnet:floor": 180000,
-        "anthropic/claude-3.7-sonnet:thinking": 180000,
-        "anthropic/claude-3.5-haiku:floor": 150000,
-        "openai/gpt-4o:floor": 120000, 
-        "openai/gpt-4-turbo:floor": 100000,
-    }
-    
-    default_token_limit = 100000
-    max_input_tokens = model_token_limits.get(model_id, default_token_limit)
-    
-    max_completion_tokens = 12000
-    system_tokens = llm_service.count_tokens(system_prompt) if system_prompt else 0
-    available_tokens = max_input_tokens - system_tokens - max_completion_tokens - 100  
-    
-    api_messages = []
-    if system_prompt:
-        api_messages.append({"role": "system", "content": system_prompt})
-    
-    current_tokens = 0
-    user_messages = []
-    assistant_messages = []
-    
-    for msg in messages:
-        if msg["role"] == "user":
-            user_messages.append(msg)
-        else:
-            assistant_messages.append(msg)
-    
-    if user_messages:
-        last_user_message = user_messages.pop()
-    else:
-        last_user_message = None
-    
-    if assistant_messages:
-        last_assistant_message = assistant_messages.pop()
-    else:
-        last_assistant_message = None
-    
-    if user_messages:
-        first_user_message = user_messages.pop(0)
-    else:
-        first_user_message = None
-    
-    if first_user_message:
-        first_msg_tokens = llm_service.count_tokens(first_user_message["content"])
-        if current_tokens + first_msg_tokens <= available_tokens:
-            api_messages.append(first_user_message)
-            current_tokens += first_msg_tokens
-    
-    remaining_messages = []
-    i, j = 0, 0
-    while i < len(user_messages) or j < len(assistant_messages):
-        if i < len(user_messages):
-            remaining_messages.append(user_messages[i])
-            i += 1
-        if j < len(assistant_messages):
-            remaining_messages.append(assistant_messages[j])
-            j += 1
-    
-    for msg in remaining_messages:
-        msg_tokens = llm_service.count_tokens(msg["content"])
-        
-        if current_tokens + msg_tokens > available_tokens:
-            break
-        
-        api_messages.append(msg)
-        current_tokens += msg_tokens
-    
-    if last_assistant_message:
-        last_assistant_tokens = llm_service.count_tokens(last_assistant_message["content"])
-        if current_tokens + last_assistant_tokens <= available_tokens:
-            api_messages.append(last_assistant_message)
-            current_tokens += last_assistant_tokens
-        else:
-            truncated_content = "POPRZEDNIA ODPOWIEDŹ (skrócona): " + last_assistant_message["content"][:1000] + "..."
-            truncated_tokens = llm_service.count_tokens(truncated_content)
-            if current_tokens + truncated_tokens <= available_tokens:
-                api_messages.append({"role": "assistant", "content": truncated_content})
-                current_tokens += truncated_tokens
-    
-    if last_user_message:
-        last_user_tokens = llm_service.count_tokens(last_user_message["content"])
-        
-        if current_tokens + last_user_tokens > available_tokens:
-            remaining_tokens = available_tokens - current_tokens
-            truncated_content = last_user_message["content"][:remaining_tokens * 4]  
-            modified_message = {"role": "user", "content": truncated_content}
-            api_messages.append(modified_message)
-        else:
-            api_messages.append(last_user_message)
-    
-    return api_messages
-
-def format_message_for_display(message: Dict[str, str]) -> str:
-    content = message.get("content", "")
-    
-    def replace_code_block(match):
-        lang = match.group(1) or ""
-        code = match.group(2)
-        return f"```{lang}\n{code}\n```"
-    
-    content = re.sub(r"```(.*?)\n(.*?)```", replace_code_block, content, flags=re.DOTALL)
-    
-    return content
-
-def get_conversation_title(messages: List[Dict[str, str]], llm_service: LLMService, api_key: str) -> str:
-    if not messages:
-        return f"Nowa konwersacja {datetime.now().strftime('%d-%m-%Y %H:%M')}"
-    
-    user_message = next((m["content"] for m in messages if m["role"] == "user"), "")
-    
-    if len(user_message) > 40:
-        try:
-            response = llm_service.call_llm(
-                messages=[
-                    {"role": "user", "content": f"Utwórz krótki, opisowy tytuł (max. 5 słów) dla następującej konwersacji, bez cudzysłowów: {user_message[:200]}..."}
-                ],
-                model="anthropic/claude-3.5-haiku:floor",  
-                system_prompt="Jesteś pomocnym asystentem, który tworzy krótkie, opisowe tytuły konwersacji.",
-                temperature=0.2,
-                max_tokens=20,
-                use_cache=True
-            )
-            title = response["choices"][0]["message"]["content"].strip().strip('"\'')
-            title = re.sub(r'[^\w\s\-.,]', '', title)
-            return title[:40]
-        except Exception:
-            pass
-    
-    return user_message[:40] + ("..." if len(user_message) > 40 else "")
-
-def parse_code_blocks(content):
-    if not content:
-        return []
-        
-    code_blocks = []
-    pattern = r"```([a-zA-Z0-9]*)\n(.*?)\n```"
-    matches = re.findall(pattern, content, re.DOTALL)
-    
-    for lang, code in matches:
-        language = lang.strip() if lang.strip() else "python"
-        code_blocks.append({"language": language, "code": code})
-    
-    return code_blocks
-
-def format_code_with_black(code, line_length=88):
-    """Formatuje kod Python za pomocą black"""
-    try:
-        return black.format_str(code, mode=black.Mode(line_length=line_length))
-    except:
-        return code
-
-def sidebar_component():
-    st.sidebar.title("AI Asystent Developera")
-    
-    with st.sidebar.expander("⚙️ Ustawienia modelu", expanded=False):
-        model_options = {model["id"]: f"{model['name']}" for model in MODEL_OPTIONS}
-        selected_model = st.selectbox(
-            "Model LLM",
-            options=list(model_options.keys()),
-            format_func=lambda x: model_options[x],
-            index=0,
-            key="model_selection"
-        )
-        
-        for model in MODEL_OPTIONS:
-            if model["id"] == selected_model:
-                st.info(model["description"])
-        
-        temperature = st.slider(
-            "Temperatura",
-            min_value=0.0,
-            max_value=1.0,
-            value=st.session_state.get("temperature", 0.7),
-            step=0.1,
-            help="Wyższa wartość = bardziej kreatywne odpowiedzi"
-        )
-        
-        st.session_state["temperature"] = temperature
-        
-        custom_system_prompt = st.text_area(
-            "Prompt systemowy (opcjonalnie)",
-            value=st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT),
-            help="Dostosuj zachowanie asystenta"
-        )
-        
-        if st.button("Zresetuj do domyślnego"):
-            custom_system_prompt = DEFAULT_SYSTEM_PROMPT
-        
-        st.session_state["custom_system_prompt"] = custom_system_prompt
-        
-        optimize_code = st.checkbox(
-            "Optymalizuj długie kody",
-            value=st.session_state.get("optimize_code", True),
-            help="Formatuje otrzymane bloki kodu za pomocą black"
-        )
-        
-        st.session_state["optimize_code"] = optimize_code
-    
-    if "token_usage" in st.session_state:
-        with st.sidebar.expander("📊 Statystyki tokenów", expanded=False):
-            st.metric("Tokeny prompt", st.session_state["token_usage"]["prompt"])
-            st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
-            st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
-    
-    db = st.session_state.get("db")
-    if db:
-        with st.sidebar.expander("💬 Konwersacje", expanded=True):
-            conversations = db.get_conversations()
-            
-            if conversations:
-                for conv in conversations:
-                    col1, col2 = st.columns([4, 1])
-                    with col1:
-                        if st.button(conv["title"], key=f"conv_{conv['id']}", use_container_width=True):
-                            st.session_state["current_conversation_id"] = conv["id"]
-                            st.rerun()
-                    with col2:
-                        if st.button("🗑️", key=f"del_{conv['id']}", help="Usuń konwersację"):
-                            db.delete_conversation(conv["id"])
-                            if st.session_state.get("current_conversation_id") == conv["id"]:
-                                st.session_state["current_conversation_id"] = None
-                            st.rerun()
-            else:
-                st.write("Brak zapisanych konwersacji")
-        
-        if st.sidebar.button("➕ Nowa konwersacja", use_container_width=True):
-            st.session_state["current_conversation_id"] = str(uuid.uuid4())
-            if "current_stream_response" in st.session_state:
-                del st.session_state["current_stream_response"]
-            st.rerun()
-
 class LLMService:
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -699,12 +465,246 @@ class LLMService:
                 }
                 yield error_info
 
-def calculate_cost(model_id: str, prompt_tokens: int, completion_tokens: int) -> float:
+def prepare_messages_with_token_management(messages, system_prompt, model_id, llm_service):
+    model_token_limits = {
+        "anthropic/claude-3.7-sonnet:floor": 180000,
+        "anthropic/claude-3.7-sonnet:thinking": 180000,
+        "anthropic/claude-3.5-haiku:floor": 150000,
+        "openai/gpt-4o:floor": 120000, 
+        "openai/gpt-4-turbo:floor": 100000,
+    }
+    
+    default_token_limit = 100000
+    max_input_tokens = model_token_limits.get(model_id, default_token_limit)
+    
+    max_completion_tokens = 12000
+    system_tokens = llm_service.count_tokens(system_prompt) if system_prompt else 0
+    available_tokens = max_input_tokens - system_tokens - max_completion_tokens - 100  
+    
+    api_messages = []
+    if system_prompt:
+        api_messages.append({"role": "system", "content": system_prompt})
+    
+    current_tokens = 0
+    user_messages = []
+    assistant_messages = []
+    
+    for msg in messages:
+        if msg["role"] == "user":
+            user_messages.append(msg)
+        else:
+            assistant_messages.append(msg)
+    
+    if user_messages:
+        last_user_message = user_messages.pop()
+    else:
+        last_user_message = None
+    
+    if assistant_messages:
+        last_assistant_message = assistant_messages.pop()
+    else:
+        last_assistant_message = None
+    
+    if user_messages:
+        first_user_message = user_messages.pop(0)
+    else:
+        first_user_message = None
+    
+    if first_user_message:
+        first_msg_tokens = llm_service.count_tokens(first_user_message["content"])
+        if current_tokens + first_msg_tokens <= available_tokens:
+            api_messages.append(first_user_message)
+            current_tokens += first_msg_tokens
+    
+    remaining_messages = []
+    i, j = 0, 0
+    while i < len(user_messages) or j < len(assistant_messages):
+        if i < len(user_messages):
+            remaining_messages.append(user_messages[i])
+            i += 1
+        if j < len(assistant_messages):
+            remaining_messages.append(assistant_messages[j])
+            j += 1
+    
+    for msg in remaining_messages:
+        msg_tokens = llm_service.count_tokens(msg["content"])
+        
+        if current_tokens + msg_tokens > available_tokens:
+            break
+        
+        api_messages.append(msg)
+        current_tokens += msg_tokens
+    
+    if last_assistant_message:
+        last_assistant_tokens = llm_service.count_tokens(last_assistant_message["content"])
+        if current_tokens + last_assistant_tokens <= available_tokens:
+            api_messages.append(last_assistant_message)
+            current_tokens += last_assistant_tokens
+        else:
+            truncated_content = "POPRZEDNIA ODPOWIEDŹ (skrócona): " + last_assistant_message["content"][:1000] + "..."
+            truncated_tokens = llm_service.count_tokens(truncated_content)
+            if current_tokens + truncated_tokens <= available_tokens:
+                api_messages.append({"role": "assistant", "content": truncated_content})
+                current_tokens += truncated_tokens
+    
+    if last_user_message:
+        last_user_tokens = llm_service.count_tokens(last_user_message["content"])
+        
+        if current_tokens + last_user_tokens > available_tokens:
+            remaining_tokens = available_tokens - current_tokens
+            truncated_content = last_user_message["content"][:remaining_tokens * 4]  
+            modified_message = {"role": "user", "content": truncated_content}
+            api_messages.append(modified_message)
+        else:
+            api_messages.append(last_user_message)
+    
+    return api_messages
+
+def format_message_for_display(message):
+    content = message.get("content", "")
+    
+    def replace_code_block(match):
+        lang = match.group(1) or ""
+        code = match.group(2)
+        return f"```{lang}\n{code}\n```"
+    
+    content = re.sub(r"```(.*?)\n(.*?)```", replace_code_block, content, flags=re.DOTALL)
+    
+    return content
+
+def get_conversation_title(messages, llm_service, api_key):
+    if not messages:
+        return f"Nowa konwersacja {datetime.now().strftime('%d-%m-%Y %H:%M')}"
+    
+    user_message = next((m["content"] for m in messages if m["role"] == "user"), "")
+    
+    if len(user_message) > 40:
+        try:
+            response = llm_service.call_llm(
+                messages=[
+                    {"role": "user", "content": f"Utwórz krótki, opisowy tytuł (max. 5 słów) dla następującej konwersacji, bez cudzysłowów: {user_message[:200]}..."}
+                ],
+                model="anthropic/claude-3.5-haiku:floor",  
+                system_prompt="Jesteś pomocnym asystentem, który tworzy krótkie, opisowe tytuły konwersacji.",
+                temperature=0.2,
+                max_tokens=20,
+                use_cache=True
+            )
+            title = response["choices"][0]["message"]["content"].strip().strip('"\'')
+            title = re.sub(r'[^\w\s\-.,]', '', title)
+            return title[:40]
+        except Exception:
+            pass
+    
+    return user_message[:40] + ("..." if len(user_message) > 40 else "")
+
+def parse_code_blocks(content):
+    if not content:
+        return []
+        
+    code_blocks = []
+    pattern = r"```([a-zA-Z0-9]*)\n(.*?)\n```"
+    matches = re.findall(pattern, content, re.DOTALL)
+    
+    for lang, code in matches:
+        language = lang.strip() if lang.strip() else "python"
+        code_blocks.append({"language": language, "code": code})
+    
+    return code_blocks
+
+def format_code_with_black(code, line_length=88):
+    """Formatuje kod Python za pomocą black"""
+    try:
+        return black.format_str(code, mode=black.Mode(line_length=line_length))
+    except:
+        return code
+
+def sidebar_component():
+    st.sidebar.title("AI Asystent Developera")
+    
+    with st.sidebar.expander("⚙️ Ustawienia modelu", expanded=False):
+        model_options = {model["id"]: f"{model['name']}" for model in MODEL_OPTIONS}
+        selected_model = st.selectbox(
+            "Model LLM",
+            options=list(model_options.keys()),
+            format_func=lambda x: model_options[x],
+            index=0,
+            key="model_selection"
+        )
+        
+        for model in MODEL_OPTIONS:
+            if model["id"] == selected_model:
+                st.info(model["description"])
+        
+        temperature = st.slider(
+            "Temperatura",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.get("temperature", 0.7),
+            step=0.1,
+            help="Wyższa wartość = bardziej kreatywne odpowiedzi"
+        )
+        
+        st.session_state["temperature"] = temperature
+        
+        custom_system_prompt = st.text_area(
+            "Prompt systemowy (opcjonalnie)",
+            value=st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT),
+            help="Dostosuj zachowanie asystenta"
+        )
+        
+        if st.button("Zresetuj do domyślnego"):
+            custom_system_prompt = DEFAULT_SYSTEM_PROMPT
+        
+        st.session_state["custom_system_prompt"] = custom_system_prompt
+        
+        optimize_code = st.checkbox(
+            "Optymalizuj długie kody",
+            value=st.session_state.get("optimize_code", True),
+            help="Formatuje otrzymane bloki kodu za pomocą black"
+        )
+        
+        st.session_state["optimize_code"] = optimize_code
+    
+    if "token_usage" in st.session_state:
+        with st.sidebar.expander("📊 Statystyki tokenów", expanded=False):
+            st.metric("Tokeny prompt", st.session_state["token_usage"]["prompt"])
+            st.metric("Tokeny completion", st.session_state["token_usage"]["completion"])
+            st.metric("Szacunkowy koszt", f"${st.session_state['token_usage']['cost']:.4f}")
+    
+    db = st.session_state.get("db")
+    if db:
+        with st.sidebar.expander("💬 Konwersacje", expanded=True):
+            conversations = db.get_conversations()
+            
+            if conversations:
+                for conv in conversations:
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        if st.button(conv["title"], key=f"conv_{conv['id']}", use_container_width=True):
+                            st.session_state["current_conversation_id"] = conv["id"]
+                            st.rerun()
+                    with col2:
+                        if st.button("🗑️", key=f"del_{conv['id']}", help="Usuń konwersację"):
+                            db.delete_conversation(conv["id"])
+                            if st.session_state.get("current_conversation_id") == conv["id"]:
+                                st.session_state["current_conversation_id"] = None
+                            st.rerun()
+            else:
+                st.write("Brak zapisanych konwersacji")
+        
+        if st.sidebar.button("➕ Nowa konwersacja", use_container_width=True):
+            st.session_state["current_conversation_id"] = str(uuid.uuid4())
+            if "current_stream_response" in st.session_state:
+                del st.session_state["current_stream_response"]
+            st.rerun()
+
+def calculate_cost(model_id, prompt_tokens, completion_tokens):
     for model in MODEL_OPTIONS:
         if model["id"] == model_id:
             return (prompt_tokens / 1_000_000) * model["pricing"]["prompt"] + \
                    (completion_tokens / 1_000_000) * model["pricing"]["completion"]
-    return 0.0 
+    return 0.0
 
 @requires_auth
 def chat_component():
