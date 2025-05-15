@@ -10,7 +10,7 @@ from datetime import datetime
 import tiktoken
 from typing import List, Dict, Any, Optional, Generator
 import hashlib
-from functools import wraps
+from functools import wraps, lru_cache
 import traceback
 import black
 
@@ -107,6 +107,9 @@ class AssistantDB:
         )
         ''')
         
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)')
+        
         self.conn.commit()
 
     def save_message(self, conversation_id: str, role: str, content: str) -> str:
@@ -120,12 +123,17 @@ class AssistantDB:
         self.conn.commit()
         return message_id
     
-    def get_messages(self, conversation_id: str) -> List[Dict[str, Any]]:
+    def get_messages(self, conversation_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp",
-            (conversation_id,)
-        )
+        
+        query = "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp"
+        params = [conversation_id]
+        
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+            
+        cursor.execute(query, params)
         
         messages = []
         for role, content in cursor.fetchall():
@@ -135,6 +143,22 @@ class AssistantDB:
             })
                 
         return messages
+
+    def get_last_messages(self, conversation_id: str, count: int = 10) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (conversation_id, count)
+        )
+        
+        messages = []
+        for role, content in cursor.fetchall():
+            messages.append({
+                "role": role,
+                "content": content
+            })
+                
+        return messages[::-1]
 
     def get_message_count(self, conversation_id: str) -> int:
         cursor = self.conn.cursor()
@@ -182,24 +206,37 @@ class LLMService:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.cache = {}
+        try:
+            self.gpt4_encoding = tiktoken.encoding_for_model("gpt-4")
+        except:
+            self.gpt4_encoding = None
+            
+        try:
+            self.claude_encoding = tiktoken.get_encoding("cl100k_base")
+        except:
+            self.claude_encoding = None
 
     def count_tokens(self, text: str) -> int:
         if not text:
             return 0
             
         try:
-            encoding = tiktoken.encoding_for_model("gpt-4")  
-            return len(encoding.encode(text))
+            if self.gpt4_encoding:
+                return len(self.gpt4_encoding.encode(text))
+            elif self.claude_encoding:
+                return len(self.claude_encoding.encode(text))
+            else:
+                return len(text) // 4
         except:
-            try:
-                encoding = tiktoken.get_encoding("cl100k_base")
-                return len(encoding.encode(text))
-            except Exception as e:
-                return len(text) // 4  
+            return len(text) // 4
 
     def get_cache_key(self, messages, model, system_prompt, temperature):
         cache_input = f"{json.dumps(messages)}-{model}-{system_prompt}-{temperature}"
         return hashlib.md5(cache_input.encode()).hexdigest()
+
+    @lru_cache(maxsize=100)
+    def get_cached_response(self, cache_key):
+        return self.cache.get(cache_key)
 
     def call_llm(self, 
                 messages: List[Dict[str, Any]], 
@@ -210,8 +247,9 @@ class LLMService:
                 use_cache: bool = True) -> Dict[str, Any]:
         if use_cache and temperature < 0.1:  
             cache_key = self.get_cache_key(messages, model, system_prompt, temperature)
-            if cache_key in self.cache:
-                return self.cache[cache_key]
+            cached_response = self.get_cached_response(cache_key)
+            if cached_response:
+                return cached_response
         
         api_messages = []
         if system_prompt:
@@ -280,7 +318,6 @@ class LLMService:
                          max_tokens: int = 12000,
                          optimize_code: bool = True) -> Generator[str, None, None]:
         
-        # Dodanie instrukcji dotyczącej zwięzłego formatowania kodu
         if optimize_code and system_prompt:
             system_prompt += "\nJeśli podajesz długie fragmenty kodu (ponad 500 linii), staraj się minimalizować zbędne spacje i komentarze. Kod zostanie sformatowany po stronie klienta."
         elif optimize_code:
@@ -304,6 +341,9 @@ class LLMService:
         retry_delay = 2  
         last_error = None
         
+        code_start_pattern = re.compile(r"```([a-zA-Z0-9]*)")
+        code_end_pattern = re.compile(r"```")
+        
         for attempt in range(max_retries):
             try:
                 api_payload = {
@@ -322,7 +362,7 @@ class LLMService:
                     },
                     json=api_payload,
                     stream=True,
-                    timeout=600  # Zwiększamy timeout dla długich odpowiedzi
+                    timeout=600
                 )
                 
                 response.raise_for_status()
@@ -330,16 +370,15 @@ class LLMService:
                 full_response = ""
                 completion_tokens = 0
                 
-                # Zmienne do śledzenia bloków kodu
                 in_code_block = False
                 current_code = ""
                 current_lang = ""
-                code_blocks = {}  # Słownik bloków kodu {id: {"code": code, "lang": lang}}
+                code_blocks = {}
                 current_block_id = 0
                 
-                # Bufor do zbierania fragmentów
                 buffer = ""
                 chunk_collection = []
+                last_update_time = time.time()
                 
                 for line in response.iter_lines():
                     if line:
@@ -356,12 +395,9 @@ class LLMService:
                                         content_chunk = delta["content"]
                                         chunk_collection.append(content_chunk)
                                         
-                                        # Akumulujemy fragmenty w buforze
                                         buffer += content_chunk
                                         
-                                        # Co 50 fragmentów sprawdzamy, czy mamy kompletne bloki kodu
-                                        if len(chunk_collection) % 50 == 0:
-                                            # Wykrywanie bloków kodu (start)
+                                        if len(chunk_collection) % 100 == 0:
                                             if "```" in buffer and not in_code_block:
                                                 in_code_block = True
                                                 block_start = buffer.rindex("```")
@@ -369,7 +405,6 @@ class LLMService:
                                                 code_start = buffer[block_start+3:]
                                                 
                                                 if "\n" in code_start:
-                                                    # Wykrywanie języka
                                                     first_line, rest = code_start.split("\n", 1)
                                                     current_lang = first_line.strip()
                                                     current_code = rest
@@ -377,68 +412,56 @@ class LLMService:
                                                     current_lang = ""
                                                     current_code = code_start
                                                 
-                                                # Dodaj tekst przed kodem
                                                 if before_code:
                                                     full_response += before_code
-                                                    st.session_state["current_stream_response"] = full_response
                                                 
-                                                # Przygotuj marker dla bloku kodu
                                                 current_block_id += 1
                                                 code_blocks[current_block_id] = {"code": current_code, "lang": current_lang}
                                                 full_response += f"```{current_lang}\n[CODE_BLOCK_{current_block_id}]\n```"
                                                 buffer = ""
                                             
-                                            # Wykrywanie bloków kodu (koniec)
                                             elif "```" in buffer and in_code_block:
                                                 in_code_block = False
                                                 code_end = buffer.index("```")
                                                 more_code = buffer[:code_end]
                                                 after_code = buffer[code_end+3:]
                                                 
-                                                # Zaktualizuj aktualny blok kodu
                                                 code_blocks[current_block_id]["code"] += more_code
                                                 
-                                                # Dodaj tekst po kodzie
                                                 if after_code:
                                                     full_response += after_code
                                                 
                                                 buffer = ""
                                             
-                                            # Aktualizacja kodu w trakcie bloku
                                             elif in_code_block:
                                                 code_blocks[current_block_id]["code"] += buffer
                                                 buffer = ""
                                             
-                                            # Zwykły tekst poza blokiem kodu
                                             elif not in_code_block:
                                                 full_response += buffer
                                                 buffer = ""
                                         
-                                        # Co 500 znaków zapisujemy postęp
-                                        if len(full_response) % 500 == 0:
+                                        current_time = time.time()
+                                        if len(full_response) % 1000 == 0 or (current_time - last_update_time) > 2.0:
                                             st.session_state["current_stream_response"] = full_response
-                                            # Aktualizujemy też słownik bloków kodu
                                             st.session_state["code_blocks"] = code_blocks
+                                            last_update_time = current_time
                                         
                                         completion_tokens += self.count_tokens(content_chunk)
                                         
-                                        # Wysyłamy fragmenty jako generator
                                         yield content_chunk
                             except json.JSONDecodeError:
                                 pass
                 
-                # Obsługa pozostałego bufora
                 if buffer:
                     if in_code_block:
                         code_blocks[current_block_id]["code"] += buffer
                     else:
                         full_response += buffer
                 
-                # Zapisujemy pełną odpowiedź i bloki kodu
                 st.session_state["current_stream_response"] = full_response
                 st.session_state["code_blocks"] = code_blocks
                 
-                # Zwracamy metadane jako ostatni element
                 yield {
                     "full_response": full_response,
                     "code_blocks": code_blocks,
@@ -481,96 +504,97 @@ def prepare_messages_with_token_management(messages, system_prompt, model_id, ll
     system_tokens = llm_service.count_tokens(system_prompt) if system_prompt else 0
     available_tokens = max_input_tokens - system_tokens - max_completion_tokens - 100  
     
+    if not messages:
+        return []
+
     api_messages = []
     if system_prompt:
         api_messages.append({"role": "system", "content": system_prompt})
-    
-    current_tokens = 0
-    user_messages = []
-    assistant_messages = []
-    
-    for msg in messages:
-        if msg["role"] == "user":
-            user_messages.append(msg)
-        else:
-            assistant_messages.append(msg)
-    
-    if user_messages:
-        last_user_message = user_messages.pop()
-    else:
-        last_user_message = None
-    
-    if assistant_messages:
-        last_assistant_message = assistant_messages.pop()
-    else:
-        last_assistant_message = None
-    
-    if user_messages:
-        first_user_message = user_messages.pop(0)
-    else:
-        first_user_message = None
-    
-    if first_user_message:
-        first_msg_tokens = llm_service.count_tokens(first_user_message["content"])
-        if current_tokens + first_msg_tokens <= available_tokens:
-            api_messages.append(first_user_message)
-            current_tokens += first_msg_tokens
-    
-    remaining_messages = []
-    i, j = 0, 0
-    while i < len(user_messages) or j < len(assistant_messages):
-        if i < len(user_messages):
-            remaining_messages.append(user_messages[i])
-            i += 1
-        if j < len(assistant_messages):
-            remaining_messages.append(assistant_messages[j])
-            j += 1
-    
-    for msg in remaining_messages:
-        msg_tokens = llm_service.count_tokens(msg["content"])
-        
-        if current_tokens + msg_tokens > available_tokens:
+
+    last_user_msg = None
+    last_user_idx = -1
+    for i in range(len(messages)-1, -1, -1):
+        if messages[i]["role"] == "user":
+            last_user_msg = messages[i]
+            last_user_idx = i
             break
+
+    last_assistant_msg = None
+    if last_user_idx > 0:
+        for i in range(last_user_idx-1, -1, -1):
+            if messages[i]["role"] == "assistant":
+                last_assistant_msg = messages[i]
+                break
+
+    first_msg = messages[0] if messages else None
+
+    last_user_tokens = llm_service.count_tokens(last_user_msg["content"]) if last_user_msg else 0
+    last_assistant_tokens = llm_service.count_tokens(last_assistant_msg["content"]) if last_assistant_msg else 0
+    first_msg_tokens = llm_service.count_tokens(first_msg["content"]) if first_msg else 0
+    
+    important_tokens = last_user_tokens + last_assistant_tokens + first_msg_tokens
+    
+    if important_tokens <= available_tokens:
+        if first_msg and first_msg != last_user_msg and first_msg != last_assistant_msg:
+            api_messages.append(first_msg)
+            available_tokens -= first_msg_tokens
         
-        api_messages.append(msg)
-        current_tokens += msg_tokens
-    
-    if last_assistant_message:
-        last_assistant_tokens = llm_service.count_tokens(last_assistant_message["content"])
-        if current_tokens + last_assistant_tokens <= available_tokens:
-            api_messages.append(last_assistant_message)
-            current_tokens += last_assistant_tokens
-        else:
-            truncated_content = "POPRZEDNIA ODPOWIEDŹ (skrócona): " + last_assistant_message["content"][:1000] + "..."
-            truncated_tokens = llm_service.count_tokens(truncated_content)
-            if current_tokens + truncated_tokens <= available_tokens:
-                api_messages.append({"role": "assistant", "content": truncated_content})
-                current_tokens += truncated_tokens
-    
-    if last_user_message:
-        last_user_tokens = llm_service.count_tokens(last_user_message["content"])
+        if last_assistant_msg:
+            api_messages.append(last_assistant_msg)
+            available_tokens -= last_assistant_tokens
         
-        if current_tokens + last_user_tokens > available_tokens:
-            remaining_tokens = available_tokens - current_tokens
-            truncated_content = last_user_message["content"][:remaining_tokens * 4]  
-            modified_message = {"role": "user", "content": truncated_content}
-            api_messages.append(modified_message)
-        else:
-            api_messages.append(last_user_message)
-    
+        if last_user_msg:
+            api_messages.append(last_user_msg)
+            available_tokens -= last_user_tokens
+        
+        current_tokens = system_tokens + important_tokens
+        
+        remaining_messages = [msg for idx, msg in enumerate(messages) 
+                              if msg != first_msg and msg != last_assistant_msg and msg != last_user_msg]
+        
+        for msg in remaining_messages:
+            msg_tokens = llm_service.count_tokens(msg["content"])
+            
+            if current_tokens + msg_tokens <= max_input_tokens - max_completion_tokens - 100:
+                api_messages.append(msg)
+                current_tokens += msg_tokens
+            else:
+                break
+        
+        api_messages.sort(key=lambda x: messages.index(x) if x in messages else -1)
+    else:
+        if last_user_msg:
+            if last_user_tokens <= available_tokens:
+                api_messages.append(last_user_msg)
+            else:
+                truncated_content = last_user_msg["content"][:int(available_tokens * 4)]
+                api_messages.append({"role": "user", "content": truncated_content})
+                
     return api_messages
+
+def process_code_blocks(content, optimize_code=True):
+    if "```" not in content:
+        return content
+
+    code_block_pattern = re.compile(r"```([a-zA-Z0-9]*)\n(.*?)\n```", re.DOTALL)
+
+    def replace_block(match):
+        lang = match.group(1) or "python"
+        code = match.group(2)
+
+        if lang == "python" and optimize_code and len(code.splitlines()) > 10:
+            try:
+                code = format_code_with_black(code)
+            except:
+                pass
+
+        return f"```{lang}\n{code}\n```"
+
+    return code_block_pattern.sub(replace_block, content)
 
 def format_message_for_display(message):
     content = message.get("content", "")
-    
-    def replace_code_block(match):
-        lang = match.group(1) or ""
-        code = match.group(2)
-        return f"```{lang}\n{code}\n```"
-    
-    content = re.sub(r"```(.*?)\n(.*?)```", replace_code_block, content, flags=re.DOTALL)
-    
-    return content
+    return process_code_blocks(content, optimize_code=True)
 
 def get_conversation_title(messages, llm_service, api_key):
     if not messages:
@@ -599,12 +623,12 @@ def get_conversation_title(messages, llm_service, api_key):
     return user_message[:40] + ("..." if len(user_message) > 40 else "")
 
 def parse_code_blocks(content):
-    if not content:
+    if not content or "```" not in content:
         return []
         
     code_blocks = []
-    pattern = r"```([a-zA-Z0-9]*)\n(.*?)\n```"
-    matches = re.findall(pattern, content, re.DOTALL)
+    pattern = re.compile(r"```([a-zA-Z0-9]*)\n(.*?)\n```", re.DOTALL)
+    matches = pattern.findall(content)
     
     for lang, code in matches:
         language = lang.strip() if lang.strip() else "python"
@@ -613,7 +637,6 @@ def parse_code_blocks(content):
     return code_blocks
 
 def format_code_with_black(code, line_length=88):
-    """Formatuje kod Python za pomocą black"""
     try:
         return black.format_str(code, mode=black.Mode(line_length=line_length))
     except:
@@ -772,60 +795,54 @@ def chat_component():
     if "code_blocks" not in st.session_state:
         st.session_state["code_blocks"] = {}
 
-    messages = db.get_messages(current_conversation_id)
+    messages = db.get_messages(current_conversation_id, limit=50)
     
-    # Wyświetl istniejące wiadomości
-    for message in messages:
-        role = message["role"]
-        content = format_message_for_display(message)
+    message_containers = st.container()
+    
+    with message_containers:
+        for message in messages:
+            role = message["role"]
+            content = format_message_for_display(message)
 
-        if role == "user":
-            with st.chat_message("user"):
-                st.markdown(content)
-        elif role == "assistant":
-            with st.chat_message("assistant"):
-                # Sprawdzanie i przetwarzanie specjalnych markerów bloków kodu
-                processed_content = content
-                code_block_pattern = r"```([a-zA-Z0-9]*)\n\[CODE_BLOCK_(\d+)\]\n```"
-                code_blocks_in_message = {}
-                
-                # Wyszukaj standardowe bloki kodu
-                regular_code_blocks = parse_code_blocks(content)
-                for i, block in enumerate(regular_code_blocks):
-                    lang = block["language"]
-                    code = block["code"]
+            if role == "user":
+                with st.chat_message("user"):
+                    st.markdown(content)
+            elif role == "assistant":
+                with st.chat_message("assistant"):
+                    processed_content = content
+                    code_block_pattern = r"```([a-zA-Z0-9]*)\n\[CODE_BLOCK_(\d+)\]\n```"
+                    code_blocks_in_message = {}
                     
-                    # Formatuj kod Python za pomocą black, jeśli włączona optymalizacja
-                    if lang == "python" and st.session_state.get("optimize_code", True) and len(code.splitlines()) > 10:
-                        try:
-                            code = format_code_with_black(code)
-                        except:
-                            pass
+                    regular_code_blocks = parse_code_blocks(content)
+                    for i, block in enumerate(regular_code_blocks):
+                        lang = block["language"]
+                        code = block["code"]
+                        
+                        if lang == "python" and st.session_state.get("optimize_code", True) and len(code.splitlines()) > 10:
+                            try:
+                                code = format_code_with_black(code)
+                            except:
+                                pass
+                        
+                        code_blocks_in_message[i+1] = {"code": code, "lang": lang}
                     
-                    # Przechowaj kod do późniejszego wyświetlenia
-                    code_blocks_in_message[i+1] = {"code": code, "lang": lang}
-                
-                # Jeśli znaleziono specjalne markery bloków kodu
-                for match in re.finditer(code_block_pattern, processed_content):
-                    lang, block_id = match.groups()
-                    block_id = int(block_id)
-                    code_marker = match.group(0)
+                    compiled_pattern = re.compile(code_block_pattern)
+                    for match in compiled_pattern.finditer(processed_content):
+                        lang, block_id = match.groups()
+                        block_id = int(block_id)
+                        code_marker = match.group(0)
+                        
+                        if block_id in code_blocks_in_message:
+                            code = code_blocks_in_message[block_id]["code"]
+                            processed_content = processed_content.replace(code_marker, f"```{lang}\n{code}\n```")
                     
-                    # Jeśli mamy kod dla tego markera, zastąp go rzeczywistym kodem
-                    if block_id in code_blocks_in_message:
-                        code = code_blocks_in_message[block_id]["code"]
-                        processed_content = processed_content.replace(code_marker, f"```{lang}\n{code}\n```")
-                
-                # Wyświetl przetworzony tekst
-                st.markdown(processed_content)
+                    st.markdown(processed_content)
     
-    # Sprawdź, czy istnieje częściowa odpowiedź, którą trzeba wyświetlić (po przerwaniu)
     if "current_stream_response" in st.session_state and st.session_state["current_stream_response"]:
         if st.session_state.get("stream_was_interrupted", False):
             with st.chat_message("assistant"):
                 st.warning("⚠️ Poprzednia odpowiedź została przerwana. Oto częściowa odpowiedź:")
                 
-                # Przetwarzamy zawartość, aby zastąpić markery bloków kodu rzeczywistym kodem
                 partial_response = st.session_state["current_stream_response"]
                 code_blocks = st.session_state.get("code_blocks", {})
                 
@@ -833,7 +850,6 @@ def chat_component():
                     marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
                     code = block_data["code"]
                     
-                    # Formatuj kod Python za pomocą black, jeśli włączona optymalizacja
                     if block_data['lang'] == "python" and st.session_state.get("optimize_code", True) and len(code.splitlines()) > 10:
                         try:
                             code = format_code_with_black(code)
@@ -844,40 +860,41 @@ def chat_component():
                 
                 st.markdown(partial_response)
                 
-                # Opcja zapisania częściowej odpowiedzi
-                if st.button("Zapisz tę częściową odpowiedź"):
+                save_partial_container = st.empty()
+                
+                if save_partial_container.button("Zapisz tę częściową odpowiedź"):
                     db.save_message(current_conversation_id, "assistant", partial_response)
                     st.session_state["current_stream_response"] = ""
                     st.session_state["code_blocks"] = {}
                     st.session_state["stream_was_interrupted"] = False
-                    st.success("Zapisano częściową odpowiedź!")
+                    save_partial_container.success("Zapisano częściową odpowiedź!")
+                    time.sleep(1)
                     st.rerun()
     
-    # Pole wejściowe użytkownika
     user_input = st.chat_input("Wpisz swoje pytanie lub zadanie...")
 
-    # Obsługa wprowadzonego komunikatu
     if user_input:
         st.session_state["stream_was_interrupted"] = False
         
         with st.chat_message("user"):
             st.markdown(user_input)
         
-        # Sprawdź, czy konwersacja ma tytuł
         if len(messages) == 0:
             conversation_title = get_conversation_title([{"role": "user", "content": user_input}], llm_service, st.session_state["api_key"])
             db.save_conversation(current_conversation_id, conversation_title)
         
         db.save_message(current_conversation_id, "user", user_input)
         
-        # Pobierz wszystkie wiadomości, aby zachować kontekst
-        all_messages = db.get_messages(current_conversation_id)
+        if len(messages) > 100:
+            first_message = db.get_messages(current_conversation_id, limit=1)
+            recent_messages = db.get_last_messages(current_conversation_id, count=50)
+            all_messages = first_message + recent_messages
+        else:
+            all_messages = db.get_messages(current_conversation_id)
         
-        # Wyświetl oczekującą odpowiedź asystenta
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             
-            # Inicjalizuj zmienne
             full_response = ""
             code_blocks = {}
             
@@ -887,7 +904,6 @@ def chat_component():
                 temperature = st.session_state.get("temperature", 0.7)
                 optimize_code = st.session_state.get("optimize_code", True)
                 
-                # Użyj funkcji optymalizującej kontekst
                 optimized_messages = prepare_messages_with_token_management(
                     all_messages, 
                     system_prompt, 
@@ -895,7 +911,6 @@ def chat_component():
                     llm_service
                 )
                 
-                # Inicjalizuj sesję streamowania
                 st.session_state["current_stream_response"] = ""
                 st.session_state["code_blocks"] = {}
                 st.session_state["stream_was_interrupted"] = False
@@ -906,12 +921,11 @@ def chat_component():
                     for chunk in llm_service.call_llm_streaming(
                         messages=optimized_messages,
                         model=model,
-                        system_prompt=None,  # System prompt jest już dodany w optimized_messages
+                        system_prompt=None,
                         temperature=temperature,
                         max_tokens=12000,
                         optimize_code=optimize_code
                     ):
-                        # Sprawdź, czy to obiekt błędu
                         if isinstance(chunk, dict) and "error" in chunk and chunk["error"]:
                             st.error(chunk["error_message"])
                             full_response = chunk.get("partial_response", "")
@@ -920,82 +934,41 @@ def chat_component():
                             st.session_state["code_blocks"] = code_blocks
                             st.session_state["stream_was_interrupted"] = True
                             
-                            # Przetwórz pełną odpowiedź, aby zastąpić markery bloków kodu
-                            for block_id, block_data in code_blocks.items():
-                                marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
-                                code = block_data["code"]
-                                
-                                # Formatuj kod Python za pomocą black
-                                if block_data['lang'] == "python" and optimize_code and len(code.splitlines()) > 10:
-                                    try:
-                                        code = format_code_with_black(code)
-                                    except:
-                                        pass
-                                
-                                full_response = full_response.replace(marker, f"```{block_data['lang']}\n{code}\n```")
+                            processed_response = process_partial_response(full_response, code_blocks, optimize_code)
                             
-                            response_placeholder.markdown(full_response)
+                            response_placeholder.markdown(processed_response)
                             break
                         
-                        # Sprawdź, czy to ostatni element z metadanymi
                         if isinstance(chunk, dict) and "full_response" in chunk:
                             metadata = chunk
                             full_response = metadata["full_response"] 
                             code_blocks = metadata.get("code_blocks", {})
                             break
                         
-                        # Aktualizuj wyświetlanie na żywo
                         if not isinstance(chunk, dict):
-                            # Pobierz aktualną pełną odpowiedź i bloki kodu ze stanu sesji
-                            full_response = st.session_state.get("current_stream_response", "")
-                            code_blocks = st.session_state.get("code_blocks", {})
+                            display_response = process_streaming_update()
                             
-                            # Przetwórz pełną odpowiedź, aby zastąpić markery bloków kodu
-                            display_response = full_response
-                            for block_id, block_data in code_blocks.items():
-                                marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
-                                if marker in display_response:
-                                    display_response = display_response.replace(marker, f"```{block_data['lang']}\n{block_data['code']}\n```")
-                            
-                            # Wyświetl odpowiedź
                             response_placeholder.markdown(display_response + "▌")
                         
                 except Exception as e:
-                    # Przechwycenie błędów streamowania
                     st.error(f"Błąd podczas streamowania: {str(e)}")
                     st.session_state["stream_was_interrupted"] = True
                     response_placeholder.markdown(full_response)
                     return
                 
-                # Przetwórz pełną odpowiedź, zastępując markery bloków kodu
                 if metadata:
                     full_response = metadata["full_response"]
                     code_blocks = metadata.get("code_blocks", {})
                 
-                processed_response = full_response
-                for block_id, block_data in code_blocks.items():
-                    marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
-                    code = block_data["code"]
-                    
-                    # Formatuj kod Python za pomocą black
-                    if block_data['lang'] == "python" and optimize_code and len(code.splitlines()) > 10:
-                        try:
-                            code = format_code_with_black(code)
-                        except:
-                            pass
-                    
-                    processed_response = processed_response.replace(marker, f"```{block_data['lang']}\n{code}\n```")
+                processed_response = process_partial_response(full_response, code_blocks, optimize_code)
                 
-                # Finalne wyświetlenie odpowiedzi bez kursora
                 response_placeholder.markdown(processed_response)
                 
-                # Aktualizuj statystyki tokenów
                 if metadata and "usage" in metadata:
                     usage = metadata["usage"]
                     st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
                     st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
                     
-                    # Oblicz koszt
                     cost = calculate_cost(
                         model, 
                         usage["prompt_tokens"], 
@@ -1004,51 +977,67 @@ def chat_component():
                     
                     st.session_state["token_usage"]["cost"] += cost
                 
-                # Zapisz odpowiedź asystenta do bazy danych
                 db.save_message(current_conversation_id, "assistant", processed_response)
                 
-                # Wyczyść pamięć streamowania po pomyślnym zapisaniu
                 st.session_state["current_stream_response"] = ""
                 st.session_state["code_blocks"] = {}
                 
-                # Odśwież stronę aby wyświetlić nową wiadomość bez spinnerów
                 st.rerun()
                 
             except Exception as e:
-                # Zapisz stan błędu i częściową odpowiedź
                 st.session_state["stream_was_interrupted"] = True
                 
                 st.error(f"Wystąpił błąd: {str(e)}")
                 st.code(traceback.format_exc())
                 
-                # Jeśli mamy częściową odpowiedź, wyświetl ją
                 if full_response:
                     st.warning("Częściowa odpowiedź przed wystąpieniem błędu:")
                     
-                    # Przetwórz odpowiedź aby zastąpić markery bloków kodu
-                    processed_response = full_response
-                    for block_id, block_data in code_blocks.items():
-                        marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
-                        code = block_data["code"]
-                        
-                        # Formatuj kod Python za pomocą black
-                        if block_data['lang'] == "python" and optimize_code and len(code.splitlines()) > 10:
-                            try:
-                                code = format_code_with_black(code)
-                            except:
-                                pass
-                        
-                        processed_response = processed_response.replace(marker, f"```{block_data['lang']}\n{code}\n```")
+                    processed_response = process_partial_response(full_response, code_blocks, optimize_code)
                     
                     st.markdown(processed_response)
                     st.session_state["current_stream_response"] = full_response
                     
-                    if st.button("Zapisz tę częściową odpowiedź"):
+                    save_button = st.empty()
+                    if save_button.button("Zapisz tę częściową odpowiedź"):
                         db.save_message(current_conversation_id, "assistant", processed_response)
                         st.session_state["current_stream_response"] = ""
                         st.session_state["code_blocks"] = {}
-                        st.success("Zapisano częściową odpowiedź!")
+                        save_button.success("Zapisano częściową odpowiedź!")
+                        time.sleep(1)
                         st.rerun()
+
+def process_streaming_update():
+    full_response = st.session_state.get("current_stream_response", "")
+    code_blocks = st.session_state.get("code_blocks", {})
+    
+    display_response = full_response
+    for block_id, block_data in code_blocks.items():
+        marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
+        if marker in display_response:
+            display_response = display_response.replace(marker, f"```{block_data['lang']}\n{block_data['code']}\n```")
+    
+    return display_response
+
+def process_partial_response(response, code_blocks, optimize_code):
+    processed_response = response
+    
+    if "[CODE_BLOCK_" not in processed_response:
+        return processed_response
+        
+    for block_id, block_data in code_blocks.items():
+        marker = f"```{block_data['lang']}\n[CODE_BLOCK_{block_id}]\n```"
+        code = block_data["code"]
+        
+        if block_data['lang'] == "python" and optimize_code and len(code.splitlines()) > 10:
+            try:
+                code = format_code_with_black(code)
+            except:
+                pass
+        
+        processed_response = processed_response.replace(marker, f"```{block_data['lang']}\n{code}\n```")
+    
+    return processed_response
 
 def main():
     st.set_page_config(
