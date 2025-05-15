@@ -13,6 +13,7 @@ import hashlib
 from functools import wraps
 import base64
 import io
+import traceback
 
 # === Konfiguracja ===
 MODEL_OPTIONS = [
@@ -24,7 +25,7 @@ MODEL_OPTIONS = [
     },
     {
         "id": "anthropic/claude-3.7-sonnet:thinking",
-        "name": "Claude 3.7 Thinking",
+        "name": "Claude 3.7 Sonnet Thinking",
         "pricing": {"prompt": 3.0, "completion": 15.0},
         "description": "Model Claude wykorzystujący dodatkowy czas na analizę problemów"
     },
@@ -32,7 +33,7 @@ MODEL_OPTIONS = [
         "id": "openai/gpt-4o:floor",
         "name": "GPT-4o",
         "pricing": {"prompt": 2.5, "completion": 10.0},
-        "description": "Silna alternatywa z dobrymi zdolnościami kodowania"
+        "description": "Silna alternatywa z dobrymi zdolnościami kodowania i analizy obrazów"
     },
     {
         "id": "openai/gpt-4-turbo:floor",
@@ -66,7 +67,6 @@ Gdy podajesz przykłady kodu, przestrzegaj tych zasad:
 
 Zawsze dziel aplikacje na logiczne komponenty i funkcje, zamiast pisać wszystko w jednym bloku kodu.
 Pamiętaj o zarządzaniu stanem sesji w Streamlit i optymalizacji kosztów przy korzystaniu z API modeli językowych.
-:floordevai.txt:
 """
 
 # === Funkcja dekoratora dla autoryzacji ===
@@ -197,6 +197,50 @@ class AssistantDB:
                 
         return messages
 
+    def get_messages_with_pagination(self, conversation_id: str, limit: int = None, offset: int = 0) -> List[Dict[str, Any]]:
+        """Pobierz wiadomości dla konwersacji z paginacją"""
+        cursor = self.conn.cursor()
+        
+        if limit is not None:
+            cursor.execute(
+                "SELECT role, content, attachments FROM messages WHERE conversation_id = ? ORDER BY timestamp LIMIT ? OFFSET ?",
+                (conversation_id, limit, offset)
+            )
+        else:
+            cursor.execute(
+                "SELECT role, content, attachments FROM messages WHERE conversation_id = ? ORDER BY timestamp",
+                (conversation_id,)
+            )
+        
+        messages = []
+        for role, content, attachments_json in cursor.fetchall():
+            try:
+                attachments = json.loads(attachments_json) if attachments_json else []
+                
+                messages.append({
+                    "role": role,
+                    "content": content,
+                    "attachments": attachments
+                })
+            except Exception as e:
+                print(f"Błąd przetwarzania załącznika: {str(e)}")
+                messages.append({
+                    "role": role,
+                    "content": content,
+                    "attachments": []
+                })
+                
+        return messages
+
+    def get_message_count(self, conversation_id: str) -> int:
+        """Pobierz liczbę wiadomości w konwersacji"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+            (conversation_id,)
+        )
+        return cursor.fetchone()[0]
+
     def save_conversation(self, conversation_id: str, title: str):
         """Utwórz lub zaktualizuj konwersację"""
         cursor = self.conn.cursor()
@@ -239,6 +283,193 @@ class AssistantDB:
         cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         self.conn.commit()
 
+# === Funkcje pomocnicze dla zarządzania kontekstem i załącznikami ===
+def prepare_messages_with_token_management(messages, system_prompt, model_id, llm_service):
+    """Przygotowuje wiadomości do wysłania, zarządzając limitami tokenów"""
+    
+    # Ustal limit tokenów dla różnych modeli
+    model_token_limits = {
+        "anthropic/claude-3.7-sonnet:floor": 180000,
+        "anthropic/claude-3.7-sonnet:thinking": 180000,
+        "anthropic/claude-3.5-haiku:floor": 150000,
+        "openai/gpt-4o:floor": 120000, 
+        "openai/gpt-4-turbo:floor": 100000,
+    }
+    
+    # Domyślny limit, jeśli model nie jest znany
+    default_token_limit = 100000
+    max_input_tokens = model_token_limits.get(model_id, default_token_limit)
+    
+    # Rezerwuj tokeny na odpowiedź i prompt systemowy
+    max_completion_tokens = 12000
+    system_tokens = llm_service.count_tokens(system_prompt) if system_prompt else 0
+    available_tokens = max_input_tokens - system_tokens - max_completion_tokens - 100  # 100 jako bufor bezpieczeństwa
+    
+    # Przygotuj wiadomości API
+    api_messages = []
+    if system_prompt:
+        api_messages.append({"role": "system", "content": system_prompt})
+    
+    # Policz tokeny aktualnych wiadomości
+    current_tokens = 0
+    user_messages = []
+    assistant_messages = []
+    
+    # Najpierw zbierz wszystkie wiadomości
+    for msg in messages:
+        if msg["role"] == "user":
+            user_messages.append(msg)
+        else:
+            assistant_messages.append(msg)
+    
+    # Zawsze dołącz ostatnią wiadomość użytkownika
+    if user_messages:
+        last_user_message = user_messages.pop()
+    else:
+        last_user_message = None
+    
+    # Zawsze dołącz ostatnią odpowiedź asystenta, jeśli istnieje
+    if assistant_messages:
+        last_assistant_message = assistant_messages.pop()
+    else:
+        last_assistant_message = None
+    
+    # Pierwsza wiadomość użytkownika jako kontekst, jeśli istnieje
+    if user_messages:
+        first_user_message = user_messages.pop(0)
+    else:
+        first_user_message = None
+    
+    # Dodaj pierwszą wiadomość użytkownika do kontekstu
+    if first_user_message:
+        first_msg_tokens = llm_service.count_tokens(first_user_message["content"])
+        if current_tokens + first_msg_tokens <= available_tokens:
+            api_messages.append(first_user_message)
+            current_tokens += first_msg_tokens
+    
+    # Proces dodawania pozostałych wiadomości w parach (zachowuje przepływ konwersacji)
+    remaining_messages = []
+    # Łączymy wiadomości z obu list naprzemiennie, zachowując kolejność
+    i, j = 0, 0
+    while i < len(user_messages) or j < len(assistant_messages):
+        if i < len(user_messages):
+            remaining_messages.append(user_messages[i])
+            i += 1
+        if j < len(assistant_messages):
+            remaining_messages.append(assistant_messages[j])
+            j += 1
+    
+    # Sortuj pozostałe wiadomości według czasu (najstarsze pierwsze)
+    # Zakładamy, że wiadomości są już uporządkowane chronologicznie w bazie danych
+    
+    # Dodaj tyle wiadomości, ile zmieści się w limicie tokenów
+    for msg in remaining_messages:
+        msg_tokens = llm_service.count_tokens(msg["content"])
+        
+        # Jeśli wiadomość nie zmieści się, przerwij
+        if current_tokens + msg_tokens > available_tokens:
+            break
+        
+        api_messages.append(msg)
+        current_tokens += msg_tokens
+    
+    # Zawsze dodaj ostatnią odpowiedź asystenta, jeśli istnieje i jest miejsce
+    if last_assistant_message:
+        last_assistant_tokens = llm_service.count_tokens(last_assistant_message["content"])
+        if current_tokens + last_assistant_tokens <= available_tokens:
+            api_messages.append(last_assistant_message)
+            current_tokens += last_assistant_tokens
+        else:
+            # Jeśli nie zmieści się cała, dodaj skróconą wersję
+            truncated_content = "POPRZEDNIA ODPOWIEDŹ (skrócona): " + last_assistant_message["content"][:1000] + "..."
+            truncated_tokens = llm_service.count_tokens(truncated_content)
+            if current_tokens + truncated_tokens <= available_tokens:
+                api_messages.append({"role": "assistant", "content": truncated_content})
+                current_tokens += truncated_tokens
+    
+    # Zawsze dodaj ostatnią wiadomość użytkownika
+    if last_user_message:
+        last_user_tokens = llm_service.count_tokens(last_user_message["content"])
+        
+        # Jeśli ostatnia wiadomość użytkownika jest za długa, spróbuj ją skrócić
+        if current_tokens + last_user_tokens > available_tokens:
+            # Oblicz, ile tokenów możemy użyć
+            remaining_tokens = available_tokens - current_tokens
+            
+            # Jeśli za mało miejsca, dodaj tylko treść bez załączników
+            if "attachments" in last_user_message and last_user_message["attachments"]:
+                # Wyodrębnij treść bez załączników
+                main_content = last_user_message["content"].split("\n\n[Załącznik")[0]
+                main_content_tokens = llm_service.count_tokens(main_content)
+                
+                if main_content_tokens <= remaining_tokens:
+                    # Dodaj tylko główną treść
+                    modified_message = {"role": "user", "content": main_content}
+                    api_messages.append(modified_message)
+                else:
+                    # Skróć nawet główną treść, jeśli potrzeba
+                    truncated_content = main_content[:remaining_tokens * 4]  # Przybliżenie
+                    modified_message = {"role": "user", "content": truncated_content}
+                    api_messages.append(modified_message)
+            else:
+                # Skróć wiadomość użytkownika, jeśli nie ma załączników
+                truncated_content = last_user_message["content"][:remaining_tokens * 4]  # Przybliżenie
+                modified_message = {"role": "user", "content": truncated_content}
+                api_messages.append(modified_message)
+        else:
+            # Dodaj pełną wiadomość
+            api_messages.append(last_user_message)
+    
+    return api_messages
+
+def process_attachments(attachments):
+    """Przetwarza załączniki w format odpowiedni do wysłania do API"""
+    processed_content = ""
+    
+    for attachment in attachments:
+        att_type = attachment.get("type")
+        att_name = attachment.get("name", "")
+        
+        if att_type == "file" and "text_content" in attachment:
+            processed_content += f"\n\n[ZAŁĄCZNIK: {att_name}]\n{attachment['text_content']}\n"
+        elif att_type == "image":
+            processed_content += f"\n\n[OBRAZ: {att_name}]\n"
+    
+    return processed_content.strip()
+
+def extract_image_content(image_file):
+    """Konwertuje obraz na base64 dla modeli wspierających obrazy (np. GPT-4o)"""
+    try:
+        # Pobierz dane obrazu
+        image_data = image_file.getvalue()
+        
+        # Konwertuj na base64
+        base64_image = base64.b64encode(image_data).decode('utf-8')
+        
+        # Określ typ MIME na podstawie rozszerzenia pliku
+        mime_type = "image/jpeg"  # domyślny typ
+        if isinstance(image_file, io.BytesIO):
+            # Obsługa dla BytesIO
+            mime_type = "image/jpeg"  # Domyślnie zakładamy JPEG
+        else:
+            # Obsługa dla plików z nazwą
+            try:
+                file_name = image_file.name.lower()
+                if file_name.endswith('.png'):
+                    mime_type = "image/png"
+                elif file_name.endswith(('.jpg', '.jpeg')):
+                    mime_type = "image/jpeg"
+            except:
+                pass
+        
+        return {
+            "base64_data": base64_image,
+            "mime_type": mime_type
+        }
+    except Exception as e:
+        print(f"Błąd podczas przetwarzania obrazu: {str(e)}")
+        return None
+
 # === Serwis LLM ===
 class LLMService:
     def __init__(self, api_key: str):
@@ -254,8 +485,12 @@ class LLMService:
             return len(encoding.encode(text))
         except:
             # Fallback do cl100k_base, jeśli określone kodowanie nie jest dostępne
-            encoding = tiktoken.get_encoding("cl100k_base")
-            return len(encoding.encode(text))
+            try:
+                encoding = tiktoken.get_encoding("cl100k_base")
+                return len(encoding.encode(text))
+            except Exception as e:
+                # Ostateczny fallback - prymitywne oszacowanie
+                return len(text) // 4  # Bardzo zgrubne przybliżenie: ~4 znaki na token
 
     def get_cache_key(self, messages, model, system_prompt, temperature):
         """Generuj klucz pamięci podręcznej dla zapytania LLM"""
@@ -263,13 +498,13 @@ class LLMService:
         return hashlib.md5(cache_input.encode()).hexdigest()
 
     def call_llm(self, 
-                messages: List[Dict[str, str]], 
+                messages: List[Dict[str, Any]], 
                 model: str = "anthropic/claude-3.7-sonnet:floor", 
                 system_prompt: str = None, 
                 temperature: float = 0.7, 
-                max_tokens: int = 12000,  # Zwiększenie max_tokens dla jeszcze dłuższych odpowiedzi
+                max_tokens: int = 12000,
                 use_cache: bool = True) -> Dict[str, Any]:
-        """Wywołaj API LLM przez OpenRouter z opcjonalnym cachowaniem"""
+        """Wywołaj API LLM przez OpenRouter z obsługą obrazów i załączników"""
         # Sprawdź pamięć podręczną, jeśli używamy cachowania
         if use_cache and temperature < 0.1:  # Cachujemy tylko deterministyczne odpowiedzi
             cache_key = self.get_cache_key(messages, model, system_prompt, temperature)
@@ -280,12 +515,45 @@ class LLMService:
         api_messages = []
         if system_prompt:
             api_messages.append({"role": "system", "content": system_prompt})
-        api_messages.extend(messages)
+        
+        # Przeanalizuj każdą wiadomość, szukając obrazów do konwersji
+        for msg in messages:
+            message_content = msg.get("content", "")
+            attachments = msg.get("attachments", [])
+            
+            # Obsługa obrazów dla modeli, które je wspierają (jak GPT-4o)
+            if msg.get("role") == "user" and "attachments" in msg and any(att.get("type") == "image" for att in attachments):
+                # Przygotuj format dla obrazów, jeśli używamy modeli obsługujących obrazy
+                if model in ["openai/gpt-4o:floor", "openai/gpt-4-vision"]:
+                    content_parts = [{"type": "text", "text": message_content}]
+                    
+                    for attachment in attachments:
+                        if attachment.get("type") == "image" and attachment.get("image_data"):
+                            content_parts.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{attachment.get('mime_type', 'image/jpeg')};base64,{attachment['image_data']['base64_data']}",
+                                }
+                            })
+                    
+                    api_messages.append({"role": msg["role"], "content": content_parts})
+                else:
+                    # Dla modeli bez wsparcia obrazów, dodaj tylko tekst z opisem załączników
+                    api_messages.append({"role": msg["role"], "content": message_content})
+            else:
+                # Zwykła wiadomość tekstowa
+                api_messages.append({"role": msg["role"], "content": message_content})
         
         # Oblicz tokeny promptu
         prompt_text = system_prompt or ""
         for msg in messages:
-            prompt_text += msg["content"]
+            if isinstance(msg.get("content"), str):
+                prompt_text += msg["content"]
+            elif isinstance(msg.get("content"), list):  # Dla wiadomości multimodalnych (GPT-4o)
+                for part in msg["content"]:
+                    if part.get("type") == "text":
+                        prompt_text += part.get("text", "")
+        
         prompt_tokens = self.count_tokens(prompt_text)
         
         # Zdefiniuj parametry ponawiania
@@ -295,19 +563,21 @@ class LLMService:
         # Próba wywołania API z ponawianiem
         for attempt in range(max_retries):
             try:
+                api_payload = {
+                    "model": model,
+                    "messages": api_messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                }
+                
                 response = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json"
                     },
-                    json={
-                        "model": model,
-                        "messages": api_messages,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens
-                    },
-                    timeout=120  # Zwiększenie timeout do 2 minut
+                    json=api_payload,
+                    timeout=180  # Zwiększenie timeout do 3 minut
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -316,7 +586,7 @@ class LLMService:
                 response_content = result["choices"][0]["message"]["content"]
                 completion_tokens = self.count_tokens(response_content)
                 
-                # Dodaj informacje o tokenach i tworzenach do wyniku
+                # Dodaj informacje o tokenach do wyniku
                 result["usage"] = {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
@@ -468,6 +738,9 @@ def sidebar_component():
         # Przycisk nowej konwersacji
         if st.sidebar.button("➕ Nowa konwersacja", use_container_width=True):
             st.session_state["current_conversation_id"] = str(uuid.uuid4())
+            # Wyczyść załączniki dla nowej konwersacji
+            st.session_state["attachments"] = []
+            st.session_state["attached_images"] = {}
             st.rerun()
 
 @requires_auth
@@ -574,7 +847,7 @@ def chat_component():
                                 img_data = st.session_state["attached_images"][attachment.get("name")]
                                 st.image(img_data, caption=attachment.get("name", "Załącznik"))
                         except Exception as e:
-                            pass
+                            st.warning(f"Nie można wyświetlić obrazu: {attachment.get('name')}")
 
         elif role == "assistant":
             with st.chat_message("assistant"):
@@ -703,48 +976,41 @@ def chat_component():
                             img_data = st.session_state["attached_images"][attachment.get("name")]
                             st.image(img_data, caption=attachment.get("name", "Załącznik"))
                     except Exception as e:
-                        pass
+                        st.error(f"Błąd wyświetlania obrazu: {str(e)}")
         
         # Przygotuj treść wiadomości i załączniki
         message_content = user_input
-
-        # Kopiujemy załączniki ze stanu sesji
+        
+        # Przetwórz załączniki
         attachments_to_send = []
         for attachment in st.session_state.get("attachments", []):
             attachment_copy = attachment.copy()
+            
+            # Dodaj dane obrazu dla modeli obsługujących obrazy
+            if attachment.get("type") == "image" and attachment.get("name") in st.session_state["attached_images"]:
+                img_data = st.session_state["attached_images"][attachment.get("name")]
+                image_content = extract_image_content(io.BytesIO(img_data))
+                if image_content:
+                    attachment_copy["image_data"] = image_content
+                    
             attachments_to_send.append(attachment_copy)
-
+        
         # Dodaj informacje o załącznikach do treści wiadomości
-        if attachments_to_send:
-            attachment_descriptions = []
-            for attachment in attachments_to_send:
-                if attachment.get("type") == "image":
-                    attachment_descriptions.append(f"[Załącznik obrazu: {attachment.get('name', 'image')}]")
-                elif attachment.get("type") == "file" and attachment.get("text_content"):
-                    attachment_descriptions.append(f"[Załącznik pliku: {attachment.get('name', 'file')}]\n{attachment.get('text_content')}")
-
-            if attachment_descriptions:
-                message_content += "\n\n" + "\n\n".join(attachment_descriptions)
-
+        attachments_text = process_attachments(attachments_to_send)
+        if attachments_text:
+            message_content += "\n\n" + attachments_text
+        
         # Sprawdź, czy konwersacja ma tytuł
         if len(messages) == 0:
             conversation_title = get_conversation_title([{"role": "user", "content": user_input}], llm_service, st.session_state["api_key"])
             db.save_conversation(current_conversation_id, conversation_title)
-
+        
         # Zapisz wiadomość użytkownika w bazie danych
         db.save_message(current_conversation_id, "user", user_input, attachments_to_send)
-
-        # Przygotuj wiadomości dla API
-        api_messages = []
-        for msg in messages:
-            api_messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-
-        # Dodaj aktualną wiadomość użytkownika
-        api_messages.append({"role": "user", "content": message_content})
-
+        
+        # Pobierz wszystkie wiadomości, aby zachować kontekst
+        all_messages = db.get_messages(current_conversation_id)
+        
         # Wyświetl oczekującą odpowiedź asystenta
         with st.chat_message("assistant"):
             with st.spinner("Generowanie odpowiedzi..."):
@@ -752,32 +1018,40 @@ def chat_component():
                     model = st.session_state.get("model_selection", MODEL_OPTIONS[0]["id"])
                     system_prompt = st.session_state.get("custom_system_prompt", DEFAULT_SYSTEM_PROMPT)
                     temperature = st.session_state.get("temperature", 0.7)
-
-                    response = llm_service.call_llm(
-                        messages=api_messages,
-                        model=model,
-                        system_prompt=system_prompt,
-                        temperature=temperature,
-                        max_tokens=12000  # Zwiększone z 8000 do 12000 dla jeszcze dłuższych odpowiedzi
+                    
+                    # Użyj funkcji optymalizującej kontekst
+                    optimized_messages = prepare_messages_with_token_management(
+                        all_messages, 
+                        system_prompt, 
+                        model, 
+                        llm_service
                     )
-
+                    
+                    response = llm_service.call_llm(
+                        messages=optimized_messages,
+                        model=model,
+                        system_prompt=None,  # System prompt jest już dodany w optimized_messages
+                        temperature=temperature,
+                        max_tokens=12000
+                    )
+                    
                     assistant_response = response["choices"][0]["message"]["content"]
-
+                    
                     # Aktualizuj statystyki tokenów
                     if "usage" in response:
                         usage = response["usage"]
                         st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
                         st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
-
+                        
                         # Oblicz koszt
                         cost = calculate_cost(
                             model, 
                             usage["prompt_tokens"], 
                             usage["completion_tokens"]
                         )
-
+                        
                         st.session_state["token_usage"]["cost"] += cost
-
+                    
                     # Zapisz odpowiedź asystenta
                     db.save_message(current_conversation_id, "assistant", assistant_response)
                     
@@ -796,6 +1070,7 @@ def chat_component():
                     
                 except Exception as e:
                     st.error(f"Wystąpił błąd: {str(e)}")
+                    st.code(traceback.format_exc())
 
 # === Główna aplikacja ===
 def main():
