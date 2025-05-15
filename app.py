@@ -577,7 +577,7 @@ class LLMService:
                         "Content-Type": "application/json"
                     },
                     json=api_payload,
-                    timeout=180  # Zwiększenie timeout do 3 minut
+                    timeout=300  # Zwiększenie timeout do 3 minut
                 )
                 response.raise_for_status()
                 result = response.json()
