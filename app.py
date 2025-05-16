@@ -990,6 +990,10 @@ def chat_component():
                             metadata = chunk
                             full_response = metadata["full_response"] 
                             code_blocks = metadata.get("code_blocks", {})
+                            
+                            # Przetwarzanie odpowiedzi i wyświetlenie finalnej wersji
+                            processed_response = process_partial_response(full_response, code_blocks, optimize_code)
+                            response_placeholder.markdown(processed_response)
                             break
 
                         if not isinstance(chunk, dict):
@@ -1005,27 +1009,30 @@ def chat_component():
                 if metadata:
                     full_response = metadata["full_response"]
                     code_blocks = metadata.get("code_blocks", {})
+                    
+                    # Ponownie przetwarzam odpowiedź, aby upewnić się, że wyświetlona jest poprawna wersja
+                    processed_response = process_partial_response(full_response, code_blocks, optimize_code)
+                    response_placeholder.markdown(processed_response)
 
-                processed_response = process_partial_response(full_response, code_blocks, optimize_code)
-                response_placeholder.markdown(processed_response)
+                    if "usage" in metadata:
+                        usage = metadata["usage"]
+                        st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
+                        st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
 
-                if metadata and "usage" in metadata:
-                    usage = metadata["usage"]
-                    st.session_state["token_usage"]["prompt"] += usage["prompt_tokens"]
-                    st.session_state["token_usage"]["completion"] += usage["completion_tokens"]
+                        cost = calculate_cost(
+                            model, 
+                            usage["prompt_tokens"], 
+                            usage["completion_tokens"]
+                        )
 
-                    cost = calculate_cost(
-                        model, 
-                        usage["prompt_tokens"], 
-                        usage["completion_tokens"]
-                    )
+                        st.session_state["token_usage"]["cost"] += cost
 
-                    st.session_state["token_usage"]["cost"] += cost
-
-                db.save_message(current_conversation_id, "assistant", processed_response)
-                st.session_state["current_stream_response"] = ""
-                st.session_state["code_blocks"] = {}
-                st.rerun()
+                    # Zapisujemy przetworzoną odpowiedź do bazy danych
+                    db.save_message(current_conversation_id, "assistant", processed_response)
+                    
+                    # Czyszczenie tymczasowych danych streamowania
+                    st.session_state["current_stream_response"] = ""
+                    st.session_state["code_blocks"] = {}
 
             except Exception as e:
                 st.session_state["stream_was_interrupted"] = True
