@@ -4,5 +4,3 @@ tiktoken>=0.5.2
 python-dateutil>=2.8.2
 chardet             
 black
-google-auth
-PyDrive2
